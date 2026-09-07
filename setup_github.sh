@@ -46,16 +46,19 @@ else
   git push -u origin main
 fi
 
+# gh secret/variable need the fully qualified OWNER/REPO, not the bare name.
+FULL_REPO="$(gh repo view "$REPO_NAME" --json nameWithOwner -q .nameWithOwner)"
+
 # --- secrets (values piped in, never echoed)
-echo "Setting secrets..."
+echo "Setting secrets on $FULL_REPO..."
 for key in CAPITAL_API_KEY CAPITAL_IDENTIFIER CAPITAL_PASSWORD; do
-  printf '%s' "$(get "$key")" | gh secret set "$key" --repo "$REPO_NAME"
+  printf '%s' "$(get "$key")" | gh secret set "$key" --repo "$FULL_REPO"
   echo "  set $key"
 done
 
 # Non-secret config, editable from the GitHub UI later.
-gh variable set DRY_RUN --body "true" --repo "$REPO_NAME" >/dev/null
-gh variable set CAPITAL_EPIC --body "$(get CAPITAL_EPIC)" --repo "$REPO_NAME" >/dev/null
+gh variable set DRY_RUN --body "true" --repo "$FULL_REPO" >/dev/null
+gh variable set CAPITAL_EPIC --body "$(get CAPITAL_EPIC)" --repo "$FULL_REPO" >/dev/null
 echo "  set DRY_RUN=true and CAPITAL_EPIC"
 
 # --- confirm .env did not get committed
