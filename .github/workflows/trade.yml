@@ -60,6 +60,12 @@ jobs:
           CAPITAL_EPIC: ${{ vars.CAPITAL_EPIC || 'BTCUSD' }}
           CAPITAL_RESOLUTION: MINUTE_5
 
+          # Email alerts. Same mailbox and app password as marketing-bot.
+          # If these are unset the bot still trades, just silently.
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          ALERT_RECIPIENTS: ${{ vars.ALERT_RECIPIENTS }}
+
           RISK_PER_TRADE_PCT: "1.0"
           DAILY_LOSS_LIMIT_PCT: "3.0"
           MAX_CONCURRENT_POSITIONS: "1"

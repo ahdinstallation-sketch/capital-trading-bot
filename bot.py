@@ -22,6 +22,7 @@ import datetime as dt
 from typing import Dict, List, Optional, Tuple
 
 from capital_client import CapitalClient, CapitalError
+from notify import send_alert
 
 # ------------------------------------------------------------------ config
 
@@ -176,6 +177,20 @@ class RiskEngine:
         day["trades"] = day.get("trades", 0) + 1
         save_state(self.state)
 
+    def first_time_today(self, key: str) -> bool:
+        """
+        True only the first time `key` is seen today. Used so a condition that
+        persists across every poll -- the daily loss halt, for instance -- sends
+        one email rather than one every 30 minutes.
+        """
+        day = self._day()
+        seen = day.setdefault("alerted", [])
+        if key in seen:
+            return False
+        seen.append(key)
+        save_state(self.state)
+        return True
+
 
 # ------------------------------------------------------------------- sizing
 
@@ -290,8 +305,35 @@ def manage_overnight(client: CapitalClient, positions: List[Dict]) -> None:
             continue
         try:
             client.close_position(deal_id)
+            send_alert(
+                "Trading bot: closed %s before overnight" % EPIC,
+                [
+                    "Flattened ahead of the %s UTC cutoff to avoid the overnight"
+                    % SESSION_CUTOFF_UTC,
+                    "financing charge.",
+                    "",
+                    "direction  %s" % direction,
+                    "size       %.4f" % size,
+                    "deal       %s" % deal_id,
+                ],
+            )
         except CapitalError as exc:
+            # A failed close means the position carries overnight unintentionally
+            # -- exactly the thing this routine exists to prevent. Say so loudly.
             log.error("could not close %s: %s", deal_id, exc)
+            send_alert(
+                "Trading bot: FAILED to close %s before overnight" % EPIC,
+                [
+                    "The overnight flatten did NOT succeed. This position will",
+                    "carry through the financing charge unless you close it",
+                    "manually in the platform.",
+                    "",
+                    "direction  %s" % direction,
+                    "size       %.4f" % size,
+                    "deal       %s" % deal_id,
+                    "error      %s" % exc,
+                ],
+            )
 
 
 def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
@@ -315,6 +357,20 @@ def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
     blocked = risk.veto(balance, len(open_positions))
     if blocked:
         log.warning("RISK VETO - %s", blocked)
+        # The daily halt persists for the rest of the day, so alert once.
+        if "daily loss limit" in blocked and risk.first_time_today("daily_loss"):
+            send_alert(
+                "Trading bot: DAILY LOSS LIMIT HIT - trading halted",
+                [
+                    blocked,
+                    "",
+                    "balance   %.2f" % balance,
+                    "limit     %.1f%%" % DAILY_LOSS_LIMIT_PCT,
+                    "",
+                    "No further trades will be opened today. Open positions keep",
+                    "their broker-side stop and target.",
+                ],
+            )
         return
 
     # Do not open anything that would immediately need closing at the cutoff.
@@ -398,15 +454,39 @@ def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
         log.info("DRY RUN - not sending the order. Set DRY_RUN=false to arm.")
         return
 
-    result = client.open_position(
-        epic=EPIC,
-        direction=direction,
-        size=size,
-        stop_level=stop,
-        profit_level=target,
-    )
+    detail = [
+        "%s %s" % (direction, EPIC),
+        "",
+        "entry    %.4f" % entry,
+        "stop     %.4f  (-%.2f%%)" % (stop, STOP_DISTANCE_PCT),
+        "target   %.4f  (%.1f:1)" % (target, REWARD_TO_RISK),
+        "size     %.4f" % size,
+        "risking  %.2f of %.2f balance (%.2f%%)"
+        % (risk_cash, balance, risk_cash / balance * 100.0 if balance else 0.0),
+        "",
+        "RSI(%d)  %.1f" % (RSI_PERIOD, rsi(closes, RSI_PERIOD) or 0.0),
+        "account  %s" % ("DEMO" if client.is_demo else "LIVE"),
+    ]
+
+    try:
+        result = client.open_position(
+            epic=EPIC,
+            direction=direction,
+            size=size,
+            stop_level=stop,
+            profit_level=target,
+        )
+    except CapitalError as exc:
+        log.error("ORDER REJECTED: %s", exc)
+        send_alert(
+            "Trading bot: ORDER REJECTED (%s)" % EPIC,
+            ["The broker refused the order.", "", str(exc), ""] + detail,
+        )
+        return
+
     risk.record_trade()
     log.info("order sent: %s", result)
+    send_alert("Trading bot: opened %s %s" % (direction, EPIC), detail)
 
 
 def preflight(client: CapitalClient) -> None:
