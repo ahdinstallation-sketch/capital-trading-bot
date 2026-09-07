@@ -29,6 +29,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from capital_client import CapitalClient
+from bot import INSTRUMENTS, instrument_config
 
 
 # ------------------------------------------------------------------ helpers
@@ -210,13 +211,19 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=1000,
                     help="candles to fetch (broker caps this, usually 1000)")
     ap.add_argument("--period", type=int, default=14)
-    ap.add_argument("--stop-pct", type=float, default=1.0)
+    ap.add_argument("--stop-pct", type=float, default=None,
+                    help="default: the instrument's entry in bot.INSTRUMENTS")
     ap.add_argument("--reward-to-risk", type=float, default=1.5)
     ap.add_argument("--balance", type=float, default=36.67)
     ap.add_argument("--risk-pct", type=float, default=1.0)
     ap.add_argument("--single", nargs=2, type=float, metavar=("OVERSOLD", "OVERBOUGHT"),
                     help="test one threshold pair and print every trade")
     args = ap.parse_args()
+
+    live_cfg = instrument_config(args.epic)
+    if args.stop_pct is None:
+        args.stop_pct = float(live_cfg["stop_pct"])
+    live_band = (int(live_cfg["oversold"]), int(live_cfg["overbought"]))
 
     client = CapitalClient()
     client.login()   # read-only from here on; no arming needed to backtest
@@ -244,7 +251,7 @@ def main() -> int:
     print("%s  %s  %d candles  ~%.1f days" % (args.epic, args.resolution, len(bars), days))
     print("avg price %.1f   avg spread %.1f (%.4f%% of price)"
           % (avg_price, avg_spread, 100.0 * avg_spread / avg_price))
-    print("stop %.2f%% = %.1f points   ->  SPREAD COSTS %.3fR PER TRADE"
+    print("stop %.2f%% = %.5g points   ->  SPREAD COSTS %.3fR PER TRADE"
           % (args.stop_pct, stop_distance, spread_r))
     print("1R = $%.2f at %.1f%% risk on $%.2f" % (risk_cash, args.risk_pct, args.balance))
 
@@ -285,7 +292,7 @@ def main() -> int:
         trades = run(bars, args.period, float(oversold), float(overbought),
                      args.stop_pct, args.reward_to_risk)
         s = summarise(trades, days)
-        marker = "   <- live now" if (oversold, overbought) == (30, 70) else ""
+        marker = "   <- live now" if (oversold, overbought) == live_band else ""
         print("%-12s %7d %8.1f %7.0f %+9.2f %+10.2f%s"
               % ("%d/%d" % (oversold, overbought), s["n"], s["per_day"],
                  s["win_pct"], s["total_r"], s["total_r"] * risk_cash, marker))

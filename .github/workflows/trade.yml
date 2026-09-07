@@ -1,7 +1,8 @@
 name: trading-bot
 
-# Every 30 minutes. At ~1 billed minute per run that is ~1,440 minutes/month,
-# inside the 2,000 free minutes for a private repo.
+# Every 30 minutes. Five instruments take ~20-25 s per run; GitHub bills a
+# minimum of 1 minute, so ~1,440 minutes/month, inside the 2,000 free minutes
+# for a private repo.
 #
 # GitHub's scheduler is best-effort: runs are frequently late by 5-20 minutes
 # under load, and are never guaranteed. Do not build anything time-critical on
@@ -57,8 +58,14 @@ jobs:
           # Actions -> Variables. Defaults to a dry run if unset.
           DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
 
-          CAPITAL_EPIC: ${{ vars.CAPITAL_EPIC || 'BTCUSD' }}
-          CAPITAL_RESOLUTION: MINUTE_5
+          # Comma-separated. Each instrument's stop and RSI band live in
+          # bot.INSTRUMENTS; anything not listed there uses the fallbacks below.
+          CAPITAL_EPICS: ${{ vars.CAPITAL_EPICS || 'BTCUSD,EURUSD,GBPUSD,AUDUSD,USDJPY' }}
+          # 4-hour candles: a 30-minute poll sees every candle at least eight
+          # times, whereas 5-minute signals came and went between polls. It is
+          # also the only resolution the broker gives 166 days of history for,
+          # which is what backtest.py was run on.
+          CAPITAL_RESOLUTION: HOUR_4
 
           # Email alerts. Same mailbox and app password as marketing-bot.
           # If these are unset the bot still trades, just silently.
@@ -66,12 +73,18 @@ jobs:
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           ALERT_RECIPIENTS: ${{ vars.ALERT_RECIPIENTS }}
 
+          # With five instruments the 3% daily halt (three stopped trades) is
+          # the brake that keeps "more trades" from becoming "more losses in
+          # one day". Do not loosen it to get more activity.
           RISK_PER_TRADE_PCT: "1.0"
           DAILY_LOSS_LIMIT_PCT: "3.0"
-          MAX_CONCURRENT_POSITIONS: "1"
-          STOP_DISTANCE_PCT: "1.0"
+          # One position per instrument, three across the account. Three
+          # minimum positions need ~$12 margin of the $36.67 balance.
+          MAX_CONCURRENT_POSITIONS: "3"
           REWARD_TO_RISK: "1.5"
 
+          # Fallbacks for instruments not in bot.INSTRUMENTS.
+          STOP_DISTANCE_PCT: "1.0"
           RSI_PERIOD: "14"
           RSI_OVERSOLD: "30"
           RSI_OVERBOUGHT: "70"
@@ -79,7 +92,8 @@ jobs:
           SESSION_CUTOFF_UTC: "20:00"
           NO_NEW_TRADES_MINS_BEFORE_CUTOFF: "60"
           OVERNIGHT_HOLD_MIN_SIZE: "0"
-          HOLD_SHORTS_OVERNIGHT: "true"
+          # Hold positions the broker PAYS you to carry; flatten the ones you pay for.
+          HOLD_PAID_OVERNIGHT: "true"
         run: python bot.py --once
 
       - name: Upload log

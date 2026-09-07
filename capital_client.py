@@ -134,14 +134,20 @@ class CapitalClient:
         params: Optional[Dict[str, Any]] = None,
         payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        resp = self.session.request(
-            method,
-            self.base_url + path,
-            headers=self._auth_headers(),
-            params=params,
-            json=payload,
-            timeout=20,
-        )
+        try:
+            resp = self.session.request(
+                method,
+                self.base_url + path,
+                headers=self._auth_headers(),
+                params=params,
+                json=payload,
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            # Timeouts and DNS hiccups are broker-side failures as far as the
+            # bot is concerned: one instrument's slow reply must not take the
+            # whole pass down with a raw traceback.
+            raise CapitalError("%s %s: network error: %s" % (method, path, exc))
         if resp.status_code >= 400:
             raise CapitalError(
                 "%s %s failed (%s): %s"
