@@ -12,6 +12,11 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:        # lets you run it on demand from the Actions tab
+    inputs:
+      test_mail:
+        description: "Send one test email instead of evaluating the market"
+        type: boolean
+        default: false
 
 concurrency:
   # Never let a delayed run overlap the next one - two bots trading the same
@@ -43,7 +48,16 @@ jobs:
           key: bot-state-${{ github.run_id }}
           restore-keys: bot-state-
 
+      - name: Send test email
+        if: ${{ inputs.test_mail }}
+        env:
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          ALERT_RECIPIENTS: ${{ vars.ALERT_RECIPIENTS }}
+        run: python notify.py --test
+
       - name: Evaluate
+        if: ${{ !inputs.test_mail }}
         env:
           CAPITAL_ENV: live
           # Arming is a secret you set yourself, exactly like uncommenting the

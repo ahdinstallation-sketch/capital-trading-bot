@@ -110,3 +110,25 @@ def html_escape(s: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+if __name__ == "__main__":
+    # `python3 notify.py --test` sends one message so the mail path can be
+    # proven without waiting for a trade. Exit code says whether it worked.
+    import sys
+
+    if "--test" not in sys.argv:
+        print("usage: python3 notify.py --test")
+        sys.exit(2)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
+    ok = send_alert(
+        "Trading bot: test email",
+        [
+            "If you are reading this, alerts from the capital.com bot work.",
+            "",
+            "You will get one of these when a trade opens, an order is rejected,",
+            "a position is closed for overnight, or the daily loss limit halts trading.",
+            "Never for 'no signal'.",
+        ],
+    )
+    sys.exit(0 if ok else 1)
