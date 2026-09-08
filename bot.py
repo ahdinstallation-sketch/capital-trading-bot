@@ -88,7 +88,7 @@ def instrument_config(epic: str) -> Dict[str, float]:
 # Risk. These are the numbers that matter.
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "3.0"))
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 REWARD_TO_RISK = float(os.getenv("REWARD_TO_RISK", "1.5"))
 
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() != "false"
@@ -108,6 +108,14 @@ SESSION_CUTOFF_UTC = os.getenv("SESSION_CUTOFF_UTC", "20:00")
 NO_NEW_TRADES_MINS_BEFORE_CUTOFF = int(
     os.getenv("NO_NEW_TRADES_MINS_BEFORE_CUTOFF", "60")
 )
+# When the broker actually takes the financing charge. Read per instrument from
+# its swapChargeTimestamp; this is only the fallback. Measured 21:00 UTC on all
+# five instruments (7 Sep 2026). The flatten is pointless AFTER this moment --
+# the charge is already taken -- so the flatten window is [cutoff, swap) and
+# the no-new-payers window is [cutoff - NO_NEW_TRADES_MINS, swap). The first
+# live night ran a pass at 22:07, closed two positions that had been charged
+# at 21:00, paid the spread for nothing and re-opened one of them. Hence this.
+SWAP_CHARGE_UTC = os.getenv("SWAP_CHARGE_UTC", "21:00")
 # Positions at or above this size may be held overnight. 0 = never hold payers.
 OVERNIGHT_HOLD_MIN_SIZE = float(os.getenv("OVERNIGHT_HOLD_MIN_SIZE", "0"))
 HOLD_PAID_OVERNIGHT = (
@@ -339,6 +347,40 @@ def minutes_to_cutoff(now: Optional[dt.datetime] = None) -> float:
     return (_cutoff_today(now) - now).total_seconds() / 60.0
 
 
+def _hhmm_today(hhmm: str, now: dt.datetime) -> dt.datetime:
+    hour, _, minute = hhmm.partition(":")
+    return now.replace(hour=int(hour), minute=int(minute or 0), second=0, microsecond=0)
+
+
+def swap_time_today(info: Dict[str, Any], now: dt.datetime) -> dt.datetime:
+    """
+    The moment the broker charges overnight financing, today, UTC. Taken from
+    the instrument's own swapChargeTimestamp (time of day only); falls back
+    to SWAP_CHARGE_UTC if the field is missing.
+    """
+    try:
+        ts = (info.get("instrument", {}) or {}).get("overnightFee", {}).get("swapChargeTimestamp")
+        if ts:
+            t = dt.datetime.utcfromtimestamp(float(ts) / 1000.0)
+            return now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    return _hhmm_today(SWAP_CHARGE_UTC, now)
+
+
+def in_flatten_window(info: Dict[str, Any], now: Optional[dt.datetime] = None) -> bool:
+    """[cutoff, swap): close payers now, the charge has not been taken yet."""
+    now = now or dt.datetime.utcnow()
+    return _cutoff_today(now) <= now < swap_time_today(info, now)
+
+
+def in_no_open_window(info: Dict[str, Any], now: Optional[dt.datetime] = None) -> bool:
+    """[cutoff - N min, swap): do not open a position that would just be flattened."""
+    now = now or dt.datetime.utcnow()
+    start = _cutoff_today(now) - dt.timedelta(minutes=NO_NEW_TRADES_MINS_BEFORE_CUTOFF)
+    return start <= now < swap_time_today(info, now)
+
+
 def _unpack(raw: Dict) -> Tuple[str, str, float, str]:
     """Capital.com nests position data; tolerate both shapes."""
     pos = raw.get("position", raw)
@@ -382,11 +424,12 @@ def manage_overnight(
     close -- unless the position is big enough (OVERNIGHT_HOLD_MIN_SIZE) to
     be worth paying for. Returns the number of positions closed.
     """
-    if not positions or minutes_to_cutoff() > 0:
+    if not positions:
         return 0
 
     cache = cache if cache is not None else {}
     closed = 0
+    now = dt.datetime.utcnow()
 
     for raw in positions:
         deal_id, direction, size, epic = _unpack(raw)
@@ -394,6 +437,12 @@ def manage_overnight(
             continue
 
         rate = overnight_rate(client, epic, direction, cache)
+        info = cache.get(epic) or {}
+
+        if not in_flatten_window(info, now):
+            # Either the session is still open, or the charge has already
+            # been taken -- closing now would pay the spread for nothing.
+            continue
 
         if rate is not None and rate > 0 and HOLD_PAID_OVERNIGHT:
             log.info(
@@ -480,14 +529,6 @@ def evaluate_epic(
         log.info("%s: no signal", epic)
         return False
 
-    entry = closes[-1]
-    if direction == "BUY":
-        stop = entry * (1 - stop_pct / 100.0)
-        target = entry + (entry - stop) * REWARD_TO_RISK
-    else:
-        stop = entry * (1 + stop_pct / 100.0)
-        target = entry - (stop - entry) * REWARD_TO_RISK
-
     try:
         info = cache.get(epic)
         if info is None:
@@ -498,6 +539,32 @@ def evaluate_epic(
         step = float(rules.get("minSizeIncrement", {}).get("value", 0) or 0)
     except (CapitalError, TypeError, ValueError):
         info, min_size, step = {}, 0.0, 0.0
+
+    # Do not open something that the overnight routine would close within the
+    # hour -- unless this side is PAID to be held, in which case it is welcome.
+    if in_no_open_window(info):
+        rate = overnight_rate(client, epic, direction, cache)
+        if rate is None or rate <= 0:
+            log.info("%s: %s signal ignored - inside the pre-financing window and this side pays "
+                     "(%s%%/day)", epic, direction, "?" if rate is None else "%+.4f" % rate)
+            return False
+
+    # Size and place the stop off the LIVE price we will actually be filled at,
+    # not the last candle close. The first live USDJPY fill was 15 pips away
+    # from the candle, which put the true risk a few cents over the cap.
+    snap = info.get("snapshot", {}) or {}
+    live = snap.get("offer") if direction == "BUY" else snap.get("bid")
+    entry = float(live) if live else closes[-1]
+    if live and abs(entry - closes[-1]) / closes[-1] > 0.0005:
+        log.info("%s: candle close %.5f vs live %s %.5f - using live",
+                 epic, closes[-1], "offer" if direction == "BUY" else "bid", entry)
+
+    if direction == "BUY":
+        stop = entry * (1 - stop_pct / 100.0)
+        target = entry + (entry - stop) * REWARD_TO_RISK
+    else:
+        stop = entry * (1 + stop_pct / 100.0)
+        target = entry - (stop - entry) * REWARD_TO_RISK
 
     # Price moves are in the QUOTE currency; the balance is in the ACCOUNT
     # currency. Sizing in the wrong one is off by the exchange rate (154x on
@@ -633,16 +700,6 @@ def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
             )
         return
 
-    # Do not open anything that would immediately need closing at the cutoff.
-    remaining = minutes_to_cutoff()
-    if 0 < remaining <= NO_NEW_TRADES_MINS_BEFORE_CUTOFF:
-        log.info(
-            "session: %.0f min to cutoff (%s UTC) - no new trades",
-            remaining,
-            SESSION_CUTOFF_UTC,
-        )
-        return
-
     held = {_unpack(raw)[3] for raw in open_positions}
     open_count = len(open_positions)
 
@@ -765,8 +822,55 @@ def preflight(client: CapitalClient) -> None:
     print("")
 
 
+def status(client: CapitalClient, hours: int = 24) -> None:
+    """Balance, open positions, and what closed recently -- straight from the broker."""
+    account = client.account()
+    bal = account.get("balance", {})
+    ccy = account.get("currency", "")
+    print("")
+    print("  %s account   balance %.2f %s   available %.2f   open P&L %+.2f"
+          % ("DEMO" if client.is_demo else "LIVE", float(bal.get("balance", 0)), ccy,
+             float(bal.get("available", 0)), float(bal.get("profitLoss", 0) or 0)))
+
+    positions = client.positions()
+    print("")
+    print("  open positions: %d  (cap %d)" % (len(positions), MAX_CONCURRENT_POSITIONS))
+    for raw in positions:
+        pos = raw.get("position", raw)
+        mkt = raw.get("market", {}) or {}
+        direction = (pos.get("direction") or "").upper()
+        now_px = mkt.get("bid") if direction == "BUY" else mkt.get("offer")
+        print("    %-7s %-4s size %-6s entry %-10s now %-10s stop %-10s target %-10s P&L %+.2f"
+              % (mkt.get("epic"), direction, pos.get("size"), pos.get("level"), now_px,
+                 pos.get("stopLevel"), pos.get("profitLevel"), float(pos.get("upl") or 0)))
+
+    since = (dt.datetime.utcnow() - dt.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        tx = client._request("GET", "/api/v1/history/transactions",
+                             params={"from": since}).get("transactions", [])
+    except CapitalError as exc:
+        print("\n  could not read history: %s" % exc)
+        return
+    closed = [t for t in tx if "closed" in (t.get("note") or "").lower()]
+    fees = sum(float(t.get("size") or 0) for t in tx if "fee" in (t.get("note") or "").lower())
+    realised = sum(float(t.get("size") or 0) for t in closed)
+    print("")
+    print("  last %dh: %d trades closed, realised %+.2f, financing %+.2f"
+          % (hours, len(closed), realised, fees))
+    for t in reversed(closed):
+        print("    %s  %-7s %+.2f" % ((t.get("date") or "")[:16], t.get("instrumentName"),
+                                     float(t.get("size") or 0)))
+    print("")
+    print("  Runs: gh run list --workflow=trade.yml --limit 10")
+    print("")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Capital.com trading bot")
+    parser.add_argument(
+        "--status", action="store_true",
+        help="balance, open positions, last 24h of closed trades, then exit",
+    )
     parser.add_argument(
         "--once", action="store_true", help="single evaluation pass, then exit"
     )
@@ -814,6 +918,10 @@ def main() -> int:
 
     if args.preflight:
         preflight(client)
+        return 0
+
+    if args.status:
+        status(client)
         return 0
 
     if args.once:

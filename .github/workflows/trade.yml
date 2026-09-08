@@ -4,13 +4,17 @@ name: trading-bot
 # minimum of 1 minute, so ~1,440 minutes/month, inside the 2,000 free minutes
 # for a private repo.
 #
-# GitHub's scheduler is best-effort: runs are frequently late by 5-20 minutes
-# under load, and are never guaranteed. Do not build anything time-critical on
-# it. The overnight flatten window is 20:00-24:00 UTC, which is eight polls
-# wide, so drift is absorbed.
+# GitHub's scheduler is best-effort and, on a free private repo, worse than
+# that: the first live day it fired 5 times in 18 hours, not 36. Two things
+# help. (1) Avoid :00 and :30, the busiest minutes on GitHub's scheduler --
+# jobs on odd minutes are dropped far less. (2) An external pinger
+# (cron-job.org, same PAT as the marketing-bot jobs) calling workflow_dispatch
+# every 30 min; see BOT-OPS.md row I. The overnight flatten window is
+# 20:00-21:00 UTC (cutoff to swap charge), so at least one poll must land
+# inside it; the pinger guarantees that, GitHub alone does not.
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:        # lets you run it on demand from the Actions tab
     inputs:
       test_mail:
