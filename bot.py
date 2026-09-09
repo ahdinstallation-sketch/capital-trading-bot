@@ -28,10 +28,11 @@ import logging
 import math
 import argparse
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from capital_client import CapitalClient, CapitalError
 from notify import send_alert
+import news
 
 # ------------------------------------------------------------------ config
 
@@ -58,7 +59,10 @@ INSTRUMENTS: Dict[str, Dict[str, float]] = {
     "AUDUSD": {"stop_pct": 0.3,  "oversold": 40, "overbought": 60},
     "USDJPY": {"stop_pct": 0.3,  "oversold": 30, "overbought": 70},
 }
-DEFAULT_EPICS = "BTCUSD,EURUSD,GBPUSD,AUDUSD,USDJPY"
+# BTCUSD and USDJPY were removed 9 Sep 2026 (both negative in every backtest
+# configuration; BTC also ate half the free margin per trade). Their rows stay
+# in INSTRUMENTS so CAPITAL_EPICS can bring them back deliberately.
+DEFAULT_EPICS = "EURUSD,GBPUSD,AUDUSD"
 
 
 def _epics_from_env() -> List[str]:
@@ -95,15 +99,20 @@ DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() != "false"
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))
 
 # ---- overnight policy
-# Capital.com charges financing daily on open positions, and the SIGN differs
-# per instrument and per side. Measured 7 Sep 2026: BTCUSD longs pay, shorts
-# are paid; EURUSD/GBPUSD/AUDUSD both sides pay; USDJPY longs are paid, shorts
-# pay. So "hold shorts" is only right for BTC. The rule is instead: before the
-# cutoff, read the broker's own overnight rate for the position's side and
-# flatten anything that PAYS, unless it is large enough to be worth carrying.
-# Anything that EARNS is left alone (HOLD_PAID_OVERNIGHT=false disables that).
-# FX markets close ~21:00 UTC Friday; a 20:00 cutoff also flattens paying
-# positions before the weekend gap.
+# Capital.com charges financing daily, and the SIGN differs per instrument and
+# per side, and it moves (EURUSD shorts paid on 7 Sep, were paid on 9 Sep). So
+# the rule reads the broker's live rate every time and never assumes.
+#
+# Whether to PAY it is arithmetic, not principle. On a $450 FX position the
+# charge is 3-4 cents a night; re-entering tomorrow costs ~3 cents of spread
+# and resets a trade that needs days to reach a 4-hour-bar target. Flattening
+# FX nightly was the single biggest live-vs-backtest divergence found in the
+# 9 Sep audit: the backtest held through nights, the bot did not. So: hold
+# anything that pays LESS than OVERNIGHT_MAX_PAY_PCT per night; flatten only
+# the expensive ones (BTC longs at 0.06%/day are eight times the threshold).
+# Anything that EARNS is always held. Fridays are different: FX is shut from
+# 21:00 UTC to Sunday 21:00 and Monday can open anywhere, so everything on a
+# market that closes for the weekend is flattened, whatever it pays.
 SESSION_CUTOFF_UTC = os.getenv("SESSION_CUTOFF_UTC", "20:00")
 NO_NEW_TRADES_MINS_BEFORE_CUTOFF = int(
     os.getenv("NO_NEW_TRADES_MINS_BEFORE_CUTOFF", "60")
@@ -116,12 +125,54 @@ NO_NEW_TRADES_MINS_BEFORE_CUTOFF = int(
 # live night ran a pass at 22:07, closed two positions that had been charged
 # at 21:00, paid the spread for nothing and re-opened one of them. Hence this.
 SWAP_CHARGE_UTC = os.getenv("SWAP_CHARGE_UTC", "21:00")
-# Positions at or above this size may be held overnight. 0 = never hold payers.
+# Hold a paying position overnight if it pays no more than this (% of
+# notional per night). Measured 9 Sep 2026: EURUSD long 0.016%, GBPUSD ~0.004%,
+# AUDUSD ~0.005%, BTCUSD long 0.062%. 0.02 keeps every FX pair, drops BTC.
+OVERNIGHT_MAX_PAY_PCT = float(os.getenv("OVERNIGHT_MAX_PAY_PCT", "0.02"))
+# Positions at or above this size are held regardless ("bigger trades"). 0 = off.
 OVERNIGHT_HOLD_MIN_SIZE = float(os.getenv("OVERNIGHT_HOLD_MIN_SIZE", "0"))
 HOLD_PAID_OVERNIGHT = (
     os.getenv("HOLD_PAID_OVERNIGHT", os.getenv("HOLD_SHORTS_OVERNIGHT", "true"))
     .strip().lower() != "false"
 )
+# Flatten everything on a weekend-closing market before Friday's 21:00 UTC close.
+WEEKEND_FLATTEN = os.getenv("WEEKEND_FLATTEN", "true").strip().lower() != "false"
+
+# ---- re-entry
+# After a position in an instrument closes (stop, target, flatten -- anything),
+# do not open another in it for this long. One 4-hour bar. The backtester never
+# re-opens on the bar that closed a trade; the live bot, polling every 30 min,
+# re-entered USDJPY four minutes after a stop-out on 9 Sep. Same RSI reading,
+# second loss, spread paid twice. This closes that gap.
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "240"))
+
+# ---- correlation
+# EURUSD, GBPUSD and AUDUSD all move with the dollar (roughly 0.6-0.8), and the
+# RSI fires on the same dollar move for all three at once. Three "independent"
+# 1% positions in the same direction are one ~3% bet, which is exactly the
+# daily halt. So at most this many positions on the same side of USD.
+MAX_SAME_USD_SIDE = int(os.getenv("MAX_SAME_USD_SIDE", "2"))
+
+# ---- news
+# Stops are not guaranteed; NFP or an ECB surprise can gap 50 pips through a
+# 35-pip stop. Cheapest mitigation: do not OPEN inside a window around
+# high-impact events for the instrument's currencies. Open positions keep
+# their stops -- this is not a reason to flatten. Fails OPEN if the calendar
+# is unreachable (a nicety must not halt the bot), and says so in the log.
+NEWS_FILTER = os.getenv("NEWS_FILTER", "true").strip().lower() != "false"
+NEWS_BLACKOUT_MINUTES = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
+
+# ---- kill switch
+# The strategy's parameters are frozen from this moment. Every trade the
+# broker reports closed after it counts, in R (profit / 1% of balance). If
+# after KILL_AFTER_TRADES the running total is at or below KILL_BELOW_R, the
+# bot stops opening positions and says why on every pass until a human
+# changes this line. Decide the exit before the entry -- for the system too.
+# Rebuilt from the broker's own history every pass, so a lost cache cannot
+# reset it. Change STRATEGY_FROZEN_AT only when you change the strategy.
+STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-09-09T08:00:00")
+KILL_AFTER_TRADES = int(os.getenv("KILL_AFTER_TRADES", "60"))
+KILL_BELOW_R = float(os.getenv("KILL_BELOW_R", "-5"))
 
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
@@ -189,7 +240,8 @@ def save_state(state: Dict) -> None:
 
 
 def today_key() -> str:
-    return dt.date.today().isoformat()
+    # UTC on purpose: the runner is UTC, the cutoff is UTC, the swap is UTC.
+    return dt.datetime.utcnow().date().isoformat()
 
 
 # ---------------------------------------------------------------- risk gate
@@ -217,16 +269,22 @@ class RiskEngine:
             day["start_balance"] = balance
             save_state(self.state)
 
-    def veto(self, balance: float, open_positions: int) -> Optional[str]:
-        """Return a reason string if trading must not happen, else None."""
+    def veto(self, equity: float, open_positions: int) -> Optional[str]:
+        """
+        Return a reason string if trading must not happen, else None.
+
+        `equity` is balance plus open P&L. Measuring the day on realised
+        balance alone let three underwater positions not count until they
+        closed, which could admit a fourth trade into a bad day.
+        """
         day = self._day()
         start = day.get("start_balance")
 
         if start:
-            drawdown_pct = (start - balance) / start * 100.0
+            drawdown_pct = (start - equity) / start * 100.0
             if drawdown_pct >= DAILY_LOSS_LIMIT_PCT:
                 return (
-                    "daily loss limit hit: down %.2f%% today (limit %.2f%%). "
+                    "daily loss limit hit: down %.2f%% today on equity (limit %.2f%%). "
                     "No more trades until tomorrow."
                     % (drawdown_pct, DAILY_LOSS_LIMIT_PCT)
                 )
@@ -237,8 +295,8 @@ class RiskEngine:
                 MAX_CONCURRENT_POSITIONS,
             )
 
-        if balance <= 0:
-            return "account balance is zero or negative"
+        if equity <= 0:
+            return "account equity is zero or negative"
 
         return None
 
@@ -413,6 +471,49 @@ def overnight_rate(
         return None
 
 
+def closes_for_weekend(info: Dict[str, Any]) -> bool:
+    """True if the broker lists no Saturday hours for this market (FX does; crypto does not)."""
+    hours = (info.get("instrument", {}) or {}).get("openingHours") or {}
+    return not hours.get("sat")
+
+
+def overnight_decision(
+    rate: Optional[float], size: Optional[float], info: Dict[str, Any],
+    now: Optional[dt.datetime] = None,
+) -> Tuple[bool, str]:
+    """
+    (hold, reason) for carrying a position through tonight's financing charge.
+    One source of truth, used both to flatten before the swap and to refuse
+    opening something that would just be flattened. `size` None skips the
+    size rule (we are deciding about a position that does not exist yet).
+    """
+    now = now or dt.datetime.utcnow()
+    if WEEKEND_FLATTEN and now.weekday() == 4 and closes_for_weekend(info):
+        return False, "market closes for the weekend at 21:00 UTC; Monday can gap"
+    if rate is not None and rate > 0 and HOLD_PAID_OVERNIGHT:
+        return True, "financing is a credit (%+.4f%%/day)" % rate
+    if size is not None and OVERNIGHT_HOLD_MIN_SIZE and size >= OVERNIGHT_HOLD_MIN_SIZE:
+        return True, "size %.4f >= %.4f hold threshold" % (size, OVERNIGHT_HOLD_MIN_SIZE)
+    if rate is None:
+        return False, "financing rate unreadable; not carrying an unknown cost"
+    if -rate <= OVERNIGHT_MAX_PAY_PCT:
+        return True, "pays %.4f%%/day, under the %.3f%% threshold" % (-rate, OVERNIGHT_MAX_PAY_PCT)
+    return False, "pays %.4f%%/day, over the %.3f%% threshold" % (-rate, OVERNIGHT_MAX_PAY_PCT)
+
+
+def usd_side(epic: str, direction: str) -> Optional[str]:
+    """
+    Which side of the US dollar a position is on. BUY EURUSD and BUY AUDUSD
+    are both SHORT_USD; BUY USDJPY is LONG_USD. None for pairs without USD.
+    """
+    epic = epic.upper()
+    if epic.startswith("USD"):
+        return "LONG_USD" if direction == "BUY" else "SHORT_USD"
+    if epic.endswith("USD"):
+        return "SHORT_USD" if direction == "BUY" else "LONG_USD"
+    return None
+
+
 def manage_overnight(
     client: CapitalClient, positions: List[Dict], cache: Optional[Dict[str, Dict]] = None
 ) -> int:
@@ -444,26 +545,14 @@ def manage_overnight(
             # been taken -- closing now would pay the spread for nothing.
             continue
 
-        if rate is not None and rate > 0 and HOLD_PAID_OVERNIGHT:
-            log.info(
-                "overnight: holding %s %s %s (size %.4f) - financing is a credit (%+.4f%%/day)",
-                direction, epic, deal_id, size, rate,
-            )
+        hold, why = overnight_decision(rate, size, info, now)
+        if hold:
+            log.info("overnight: holding %s %s %s (size %.4f) - %s",
+                     direction, epic, deal_id, size, why)
             continue
 
-        if OVERNIGHT_HOLD_MIN_SIZE and size >= OVERNIGHT_HOLD_MIN_SIZE:
-            log.info(
-                "overnight: holding %s %s %s (size %.4f >= %.4f threshold)",
-                direction, epic, deal_id, size, OVERNIGHT_HOLD_MIN_SIZE,
-            )
-            continue
-
-        log.info(
-            "overnight: closing %s %s %s (size %.4f, financing %s) before cutoff %s UTC",
-            direction, epic, deal_id, size,
-            "unknown" if rate is None else "%+.4f%%/day" % rate,
-            SESSION_CUTOFF_UTC,
-        )
+        log.info("overnight: closing %s %s %s (size %.4f) - %s",
+                 direction, epic, deal_id, size, why)
         if DRY_RUN:
             log.info("DRY RUN - not closing")
             continue
@@ -473,9 +562,7 @@ def manage_overnight(
             send_alert(
                 "Trading bot: closed %s before overnight" % epic,
                 [
-                    "Flattened ahead of the %s UTC cutoff to avoid the overnight"
-                    % SESSION_CUTOFF_UTC,
-                    "financing charge.",
+                    "Flattened ahead of the %s UTC cutoff: %s." % (SESSION_CUTOFF_UTC, why),
                     "",
                     "instrument %s" % epic,
                     "direction  %s" % direction,
@@ -511,23 +598,37 @@ def evaluate_epic(
     balance: float,
     account_ccy: str,
     cache: Dict[str, Dict],
-) -> bool:
+    usd_exposure: Dict[str, int],
+) -> Optional[str]:
     """
-    One instrument, one pass. Returns True if a trade was opened (or, in dry
-    run, would have been) so the caller can count it against the position cap.
+    One instrument, one pass. Returns the direction if a trade was opened (or,
+    in dry run, would have been) so the caller can count it against the
+    position cap and the same-side-of-USD cap. None otherwise.
     """
     cfg = instrument_config(epic)
     stop_pct = float(cfg["stop_pct"])
 
     closes = client.closes(epic, RESOLUTION, count=max(RSI_PERIOD * 4, 60))
-    if not closes:
+    if len(closes) < 2:
         log.warning("%s: no price data", epic)
-        return False
+        return None
 
-    direction = signal(closes, epic, cfg)
+    # The last candle the broker returns is the one still forming. Deciding on
+    # it means the RSI repaints eight times inside a 4-hour bar and the bot
+    # trades dips that vanish when the bar closes. The backtester only ever
+    # sees completed bars; so, now, does the bot.
+    completed = closes[:-1]
+    direction = signal(completed, epic, cfg)
     if not direction:
         log.info("%s: no signal", epic)
-        return False
+        return None
+
+    side = usd_side(epic, direction)
+    if side and usd_exposure.get(side, 0) >= MAX_SAME_USD_SIDE:
+        log.info("%s: %s signal ignored - already %d position(s) %s, cap %d "
+                 "(the dollar pairs are one bet, not three)",
+                 epic, direction, usd_exposure[side], side, MAX_SAME_USD_SIDE)
+        return None
 
     try:
         info = cache.get(epic)
@@ -541,13 +642,20 @@ def evaluate_epic(
         info, min_size, step = {}, 0.0, 0.0
 
     # Do not open something that the overnight routine would close within the
-    # hour -- unless this side is PAID to be held, in which case it is welcome.
+    # hour. Same decision function as the flatten, so they cannot disagree.
     if in_no_open_window(info):
         rate = overnight_rate(client, epic, direction, cache)
-        if rate is None or rate <= 0:
-            log.info("%s: %s signal ignored - inside the pre-financing window and this side pays "
-                     "(%s%%/day)", epic, direction, "?" if rate is None else "%+.4f" % rate)
-            return False
+        hold, why = overnight_decision(rate, None, info)
+        if not hold:
+            log.info("%s: %s signal ignored - would be flattened within the hour (%s)",
+                     epic, direction, why)
+            return None
+
+    if NEWS_FILTER:
+        blocked = news.blackout(epic, NEWS_BLACKOUT_MINUTES)
+        if blocked:
+            log.info("%s: %s signal ignored - %s", epic, direction, blocked)
+            return None
 
     # Size and place the stop off the LIVE price we will actually be filled at,
     # not the last candle close. The first live USDJPY fill was 15 pips away
@@ -576,7 +684,7 @@ def evaluate_epic(
             "rule for that pair, so it is not traded.",
             epic, (info.get("instrument", {}) or {}).get("currency"), account_ccy,
         )
-        return False
+        return None
 
     size, risk_cash = position_size(balance, entry, stop, factor)
 
@@ -607,7 +715,7 @@ def evaluate_epic(
                 epic, RISK_PER_TRADE_PCT, actual_loss, balance,
                 actual_loss / balance * 100.0,
             )
-            return False
+            return None
         size = min_size
         risk_cash = actual_loss
 
@@ -619,7 +727,7 @@ def evaluate_epic(
 
     if DRY_RUN:
         log.info("DRY RUN - not sending the order. Set DRY_RUN=false to arm.")
-        return True
+        return direction
 
     detail = [
         "%s %s" % (direction, epic),
@@ -632,7 +740,7 @@ def evaluate_epic(
         % (risk_cash, balance, risk_cash / balance * 100.0 if balance else 0.0),
         "",
         "RSI(%d)  %.1f  (band %.0f/%.0f)"
-        % (RSI_PERIOD, rsi(closes, RSI_PERIOD) or 0.0, cfg["oversold"], cfg["overbought"]),
+        % (RSI_PERIOD, rsi(completed, RSI_PERIOD) or 0.0, cfg["oversold"], cfg["overbought"]),
         "account  %s" % ("DEMO" if client.is_demo else "LIVE"),
     ]
 
@@ -650,29 +758,70 @@ def evaluate_epic(
             "Trading bot: ORDER REJECTED (%s)" % epic,
             ["The broker refused the order.", "", str(exc), ""] + detail,
         )
-        return False
+        return None
 
     risk.record_trade()
     log.info("order sent: %s", result)
     send_alert("Trading bot: opened %s %s" % (direction, epic), detail)
-    return True
+    return direction
+
+
+def _parse_tx_time(t: Dict[str, Any]) -> Optional[dt.datetime]:
+    raw = (t.get("dateUtc") or t.get("dateUTC") or "")[:19]
+    try:
+        return dt.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+
+
+def closed_trades_since(client: CapitalClient, since: dt.datetime) -> Optional[List[Dict[str, Any]]]:
+    """Closed-trade transactions from the broker since `since` (UTC). None if unreadable."""
+    try:
+        tx = client.transactions(since.strftime("%Y-%m-%dT%H:%M:%S"))
+    except CapitalError as exc:
+        log.warning("could not read trade history: %s", exc)
+        return None
+    return [t for t in tx if "closed" in (t.get("note") or "").lower()]
+
+
+def scoreboard(closed: List[Dict[str, Any]], balance: float) -> Optional[str]:
+    """
+    Every trade closed since STRATEGY_FROZEN_AT, scored in R against 1% of
+    the current balance (the risk each was sized to, near enough while the
+    balance is stable). Logs the running total on every pass so the record is
+    always in the log, and returns a veto once the kill rule is met.
+    """
+    risk_cash = balance * RISK_PER_TRADE_PCT / 100.0
+    realised = sum(float(t.get("size") or 0) for t in closed)
+    total_r = realised / risk_cash if risk_cash else 0.0
+    n = len(closed)
+    log.info("record since %s: %d trades closed, %+.2f realised = %+.1fR  "
+             "(kill rule: <= %+.0fR after %d trades)",
+             STRATEGY_FROZEN_AT[:10], n, realised, total_r, KILL_BELOW_R, KILL_AFTER_TRADES)
+    if n >= KILL_AFTER_TRADES and total_r <= KILL_BELOW_R:
+        return ("KILL SWITCH: %d trades since %s total %+.1fR, at or below %+.0fR. "
+                "The strategy has failed its own test. No new positions until "
+                "STRATEGY_FROZEN_AT is changed by a human." % (n, STRATEGY_FROZEN_AT[:10],
+                                                               total_r, KILL_BELOW_R))
+    return None
 
 
 def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
     account = client.account()
-    balance = float(account.get("balance", {}).get("balance", 0.0))
+    bal = account.get("balance", {}) or {}
+    balance = float(bal.get("balance", 0.0))
+    upl = float(bal.get("profitLoss") or 0.0)
+    equity = balance + upl
     account_ccy = (account.get("currency") or "USD").upper()
-    risk.mark_session_start(balance)
+    risk.mark_session_start(equity)
     open_positions = client.positions()
     cache: Dict[str, Dict] = {}   # market() lookups, one per epic per pass
+    now = dt.datetime.utcnow()
 
     log.info(
-        "balance=%.2f  available=%.2f  open=%d  instruments=%s  mode=%s%s",
-        balance,
-        client.available(),
-        len(open_positions),
-        ",".join(EPICS),
-        "DEMO" if client.is_demo else "LIVE",
+        "balance=%.2f  open P&L=%+.2f  equity=%.2f  available=%.2f  open=%d  instruments=%s  mode=%s%s",
+        balance, upl, equity, float(bal.get("available", 0.0)), len(open_positions),
+        ",".join(EPICS), "DEMO" if client.is_demo else "LIVE",
         "  [DRY RUN]" if DRY_RUN else "",
     )
 
@@ -681,17 +830,39 @@ def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
     if manage_overnight(client, open_positions, cache):
         open_positions = client.positions()
 
-    blocked = risk.veto(balance, len(open_positions))
+    # One history read serves three things: the kill switch, the cooldown,
+    # and a running scoreboard in every log.
+    try:
+        frozen_at = dt.datetime.strptime(STRATEGY_FROZEN_AT[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        frozen_at = now
+    closed = closed_trades_since(client, min(frozen_at, now - dt.timedelta(minutes=COOLDOWN_MINUTES)))
+    cooling: Set[str] = set()
+    killed: Optional[str] = None
+    if closed is not None:
+        cutoff = now - dt.timedelta(minutes=COOLDOWN_MINUTES)
+        for t in closed:
+            when = _parse_tx_time(t)
+            if when and when >= cutoff:
+                cooling.add((t.get("instrumentName") or "").upper())
+        killed = scoreboard([t for t in closed if (_parse_tx_time(t) or now) >= frozen_at], balance)
+    else:
+        log.warning("trade history unreadable this pass: no cooldown, no kill check")
+
+    blocked = killed or risk.veto(equity, len(open_positions))
     if blocked:
-        log.warning("RISK VETO - %s", blocked)
-        # The daily halt persists for the rest of the day, so alert once.
-        if "daily loss limit" in blocked and risk.first_time_today("daily_loss"):
+        log.error("RISK VETO - %s", blocked) if killed else log.warning("RISK VETO - %s", blocked)
+        # Persistent conditions alert once a day, not every 30 minutes.
+        if killed and risk.first_time_today("kill_switch"):
+            send_alert("Trading bot: KILL SWITCH TRIPPED - no new trades",
+                       [blocked, "", "Open positions keep their broker-side stop and target."])
+        elif "daily loss limit" in blocked and risk.first_time_today("daily_loss"):
             send_alert(
                 "Trading bot: DAILY LOSS LIMIT HIT - trading halted",
                 [
                     blocked,
                     "",
-                    "balance   %.2f" % balance,
+                    "equity    %.2f" % equity,
                     "limit     %.1f%%" % DAILY_LOSS_LIMIT_PCT,
                     "",
                     "No further trades will be opened today. Open positions keep",
@@ -700,7 +871,14 @@ def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
             )
         return
 
-    held = {_unpack(raw)[3] for raw in open_positions}
+    held: Set[str] = set()
+    usd_exposure: Dict[str, int] = {}
+    for raw in open_positions:
+        _, direction, _, epic = _unpack(raw)
+        held.add(epic)
+        side = usd_side(epic, direction)
+        if side:
+            usd_exposure[side] = usd_exposure.get(side, 0) + 1
     open_count = len(open_positions)
 
     for epic in EPICS:
@@ -713,10 +891,18 @@ def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
         if epic in held:
             log.info("%s: already holding a position - skipping", epic)
             continue
+        if epic in cooling:
+            log.info("%s: a position closed here within the last %d min - cooling down",
+                     epic, COOLDOWN_MINUTES)
+            continue
         try:
-            if evaluate_epic(client, risk, epic, balance, account_ccy, cache):
+            opened = evaluate_epic(client, risk, epic, balance, account_ccy, cache, usd_exposure)
+            if opened:
                 open_count += 1
                 held.add(epic)
+                side = usd_side(epic, opened)
+                if side:
+                    usd_exposure[side] = usd_exposure.get(side, 0) + 1
         except CapitalError as exc:
             # One instrument's API trouble must not stop the others.
             log.error("%s: api error: %s", epic, exc)
@@ -846,8 +1032,7 @@ def status(client: CapitalClient, hours: int = 24) -> None:
 
     since = (dt.datetime.utcnow() - dt.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
     try:
-        tx = client._request("GET", "/api/v1/history/transactions",
-                             params={"from": since}).get("transactions", [])
+        tx = client.transactions(since)
     except CapitalError as exc:
         print("\n  could not read history: %s" % exc)
         return

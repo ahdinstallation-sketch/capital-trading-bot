@@ -20,6 +20,11 @@ Everything below is measured, not assumed:
     bar that earned them and bite from the next bar. The live bot polls
     every 30 minutes inside a 4-hour bar, so it would often react sooner;
     this is the pessimistic reading.
+  * overnight financing is charged at the broker's live rate for the side
+    held, every 21:00 UTC crossing, in R (rate / stop%). Positions that pay
+    more than OVERNIGHT_MAX_PAY_PCT are flattened at the 20:00 bar, exactly
+    as bot.py does; everything on a weekend-closing market is flattened on
+    the last bar before a gap of 8h+ (Friday close, holidays).
 
 Results are in R -- multiples of the money risked per trade. +1R is one
 winning trade's worth of risk. At 1% risk on a $135 account, 1R = $1.35.
@@ -30,11 +35,12 @@ winning trade's worth of risk. At 1% risk on a $135 account, 1R = $1.35.
 """
 
 import argparse
+import datetime as dt
 import sys
 from typing import Any, Dict, List, Optional
 
-from capital_client import CapitalClient
-from bot import INSTRUMENTS, instrument_config
+from capital_client import CapitalClient, CapitalError
+from bot import INSTRUMENTS, instrument_config, OVERNIGHT_MAX_PAY_PCT
 
 
 # ------------------------------------------------------------------ helpers
@@ -75,12 +81,14 @@ def _px(candle: Dict[str, Any], field: str, side: str) -> Optional[float]:
 class Bar(object):
     """One candle, keeping bid and ask apart so the spread stays honest."""
 
-    __slots__ = ("time", "mid_close", "bid_high", "bid_low", "ask_high",
-                 "ask_low", "ask_open", "bid_open", "spread")
+    __slots__ = ("time", "ts", "mid_close", "bid_close", "ask_close", "bid_high",
+                 "bid_low", "ask_high", "ask_low", "ask_open", "bid_open", "spread")
 
     def __init__(self, candle: Dict[str, Any]):
         self.time = candle.get("snapshotTime", "")
+        self.ts = dt.datetime.strptime(self.time[:19], "%Y-%m-%dT%H:%M:%S")
         cb, ca = _px(candle, "closePrice", "bid"), _px(candle, "closePrice", "ask")
+        self.bid_close, self.ask_close = cb, ca
         self.mid_close = (cb + ca) / 2.0
         self.bid_high = _px(candle, "highPrice", "bid")
         self.bid_low = _px(candle, "lowPrice", "bid")
@@ -96,7 +104,7 @@ def load_bars(candles: List[Dict[str, Any]]) -> List[Bar]:
     for c in candles:
         try:
             bar = Bar(c)
-        except TypeError:
+        except (TypeError, ValueError):
             continue  # incomplete candle, skip it
         if None in (bar.bid_high, bar.bid_low, bar.ask_high,
                     bar.ask_low, bar.ask_open, bar.bid_open):
@@ -110,14 +118,39 @@ def load_bars(candles: List[Dict[str, Any]]) -> List[Bar]:
 
 class Trade(object):
     __slots__ = ("side", "entry", "stop0", "stop", "target", "best", "opened",
-                 "opened_idx", "closed", "exit_px", "result_r", "outcome",
+                 "opened_idx", "closed", "exit_px", "result_r", "fin_r", "outcome",
                  "bars_held")
+
+
+class Costs(object):
+    """What the broker charges for time, per instrument. Rates in %/day, + = paid to hold."""
+
+    def __init__(self, long_rate: Optional[float] = None, short_rate: Optional[float] = None,
+                 weekend_close: bool = False, bar_minutes: int = 240,
+                 flatten_pay_over: float = OVERNIGHT_MAX_PAY_PCT):
+        self.long_rate, self.short_rate = long_rate, short_rate
+        self.weekend_close, self.bar_minutes = weekend_close, bar_minutes
+        self.flatten_pay_over = flatten_pay_over
+
+    def rate(self, side: str) -> Optional[float]:
+        return self.long_rate if side == "BUY" else self.short_rate
+
+    def flattens(self, side: str) -> bool:
+        r = self.rate(side)
+        return r is None or -r > self.flatten_pay_over
+
+
+def _bar_contains(bar: Bar, hour: int, bar_minutes: int) -> bool:
+    """Does [bar open, bar open + duration) contain today's HH:00 UTC?"""
+    mark = bar.ts.replace(hour=hour, minute=0, second=0, microsecond=0)
+    return bar.ts <= mark < bar.ts + dt.timedelta(minutes=bar_minutes)
 
 
 def run(bars: List[Bar], period: int, oversold: float, overbought: float,
         stop_pct: float, reward_to_risk: float,
         breakeven_at: Optional[float] = None,
-        trail: Optional[float] = None) -> List[Trade]:
+        trail: Optional[float] = None,
+        costs: Optional[Costs] = None) -> List[Trade]:
     """
     Walk the candles once, left to right, opening and closing trades exactly
     the way bot.py would. No lookahead: the decision at bar i uses only
@@ -131,12 +164,24 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
     """
     closes = [b.mid_close for b in bars]
     rsis = rsi_series(closes, period)
+    costs = costs or Costs()
 
     trades: List[Trade] = []
     open_trade: Optional[Trade] = None
 
+    def _close(t: Trade, px: float, outcome: str, idx: int, when: str) -> None:
+        risk = abs(t.entry - t.stop0)
+        gain = (px - t.entry) if t.side == "BUY" else (t.entry - px)
+        t.exit_px, t.outcome = px, outcome
+        t.result_r = (gain / risk if risk else 0.0) + t.fin_r
+        t.closed, t.bars_held = when, idx - t.opened_idx
+        trades.append(t)
+
     for i in range(len(bars) - 1):
         nxt = bars[i + 1]
+        # Last bar before a gap of 8h+ = Friday close (or a holiday).
+        before_gap = (costs.weekend_close and i + 2 < len(bars)
+                      and (bars[i + 2].ts - nxt.ts) > dt.timedelta(hours=8))
 
         # --- manage the open position first; one position at a time
         if open_trade is not None:
@@ -155,20 +200,33 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
                 # Both touched in one candle: we cannot know which came
                 # first, so we take the loss. Optimism here is how
                 # backtests lie.
-                t.exit_px = t.stop if hit_stop else t.target
-                gain = (t.exit_px - t.entry) if t.side == "BUY" else (t.entry - t.exit_px)
-                t.result_r = gain / risk if risk else 0.0
                 if not hit_stop:
-                    t.outcome = "TARGET"
+                    outcome = "TARGET"
                 elif t.stop == t.stop0:
-                    t.outcome = "STOP"
+                    outcome = "STOP"
                 else:
-                    t.outcome = "TRAIL" if t.result_r > 1e-9 else "BE"
-                t.closed = nxt.time
-                t.bars_held = (i + 1) - t.opened_idx
-                trades.append(t)
+                    gain = (t.stop - t.entry) if t.side == "BUY" else (t.entry - t.stop)
+                    outcome = "TRAIL" if gain > 1e-9 else "BE"
+                _close(t, t.stop if hit_stop else t.target, outcome, i + 1, nxt.time)
                 open_trade = None
                 continue  # never open on the same bar we just closed
+
+            # --- time costs, in the order the live bot meets them: the 20:00
+            # flatten for expensive payers, then the 21:00 charge for holders,
+            # then the Friday close for anything on a weekend-closing market.
+            exit_px = nxt.bid_close if t.side == "BUY" else nxt.ask_close
+            if costs.flattens(t.side) and _bar_contains(nxt, 20, costs.bar_minutes):
+                _close(t, exit_px, "FLAT", i + 1, nxt.time)
+                open_trade = None
+                continue
+            if _bar_contains(nxt, 21, costs.bar_minutes):
+                r = costs.rate(t.side)
+                if r is not None:
+                    t.fin_r += r / stop_pct
+            if before_gap:
+                _close(t, exit_px, "WKND", i + 1, nxt.time)
+                open_trade = None
+                continue
 
             # --- still open: tighten the protective stop off THIS bar's best
             # price. Takes effect on the next bar, never this one.
@@ -186,9 +244,10 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
                     t.stop = min(t.stop, t.best + trail * risk)
             continue
 
-        # --- look for a new entry
+        # --- look for a new entry. Not into a weekend: it would be flattened
+        # at this bar's close and pay the spread for nothing.
         value = rsis[i]
-        if value is None:
+        if value is None or before_gap:
             continue
         if value <= oversold:
             side = "BUY"
@@ -209,6 +268,7 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
             t.target = t.entry * (1 - stop_pct * reward_to_risk / 100.0)
         t.stop = t.stop0
         t.best = None
+        t.fin_r = 0.0
         t.opened = nxt.time
         t.opened_idx = i + 1
         t.outcome = "OPEN"
@@ -221,7 +281,7 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
 def summarise(trades: List[Trade], days: float) -> Dict[str, Any]:
     if not trades:
         return {"n": 0, "per_day": 0.0, "wins": 0, "win_pct": 0.0, "be": 0,
-                "total_r": 0.0, "avg_r": 0.0}
+                "total_r": 0.0, "avg_r": 0.0, "fin_r": 0.0, "flat": 0, "nights": 0}
     wins = sum(1 for t in trades if t.result_r > 1e-9)
     be = sum(1 for t in trades if t.outcome == "BE")
     total = sum(t.result_r for t in trades)
@@ -233,6 +293,9 @@ def summarise(trades: List[Trade], days: float) -> Dict[str, Any]:
         "be": be,
         "total_r": total,
         "avg_r": total / len(trades),
+        "fin_r": sum(t.fin_r for t in trades),
+        "flat": sum(1 for t in trades if t.outcome in ("FLAT", "WKND")),
+        "nights": sum(1 for t in trades if t.fin_r != 0.0),
     }
 
 
@@ -264,6 +327,22 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
         return
 
     minutes = RESOLUTION_MINUTES.get(args.resolution, 5)
+
+    # Time costs from the broker's own instrument record, not assumptions.
+    try:
+        info = client.market(epic)
+    except CapitalError:
+        info = {}
+    fee = (info.get("instrument", {}) or {}).get("overnightFee", {}) or {}
+    hours = (info.get("instrument", {}) or {}).get("openingHours") or {}
+    costs = Costs(
+        long_rate=None if fee.get("longRate") is None else float(fee["longRate"]),
+        short_rate=None if fee.get("shortRate") is None else float(fee["shortRate"]),
+        weekend_close=not hours.get("sat"),
+        bar_minutes=minutes,
+    )
+    if args.no_costs:
+        costs = Costs(bar_minutes=minutes)
     days = len(bars) * minutes / 1440.0
     avg_spread = sum(b.spread for b in bars) / len(bars)
     avg_price = sum(b.mid_close for b in bars) / len(bars)
@@ -282,6 +361,19 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
     print("stop %.2f%% = %.5g points   ->  SPREAD COSTS %.3fR PER TRADE"
           % (stop_pct, stop_distance, spread_r))
     print("1R = $%.2f at %.1f%% risk on $%.2f" % (risk_cash, args.risk_pct, balance))
+    if args.no_costs:
+        print("time costs: OFF (--no-costs)")
+    else:
+        def _fmt(side):
+            r = costs.rate(side)
+            if r is None:
+                return "unknown -> flattened nightly"
+            return "%+.4f%%/day = %+.3fR/night, %s" % (
+                r, r / stop_pct, "flattened at 20:00" if costs.flattens(side) else "held")
+        print("financing  long: %s" % _fmt("BUY"))
+        print("           short: %s" % _fmt("SELL"))
+        print("weekend    %s" % ("flattened before the Friday close" if costs.weekend_close
+                                  else "trades through (market open Saturday)"))
 
     # The bar the strategy has to clear. At reward:risk R, a coin-flip entry
     # breaks even at 1/(1+R) wins. The spread widens every loss and shortens
@@ -298,7 +390,7 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
     if args.single:
         oversold, overbought = args.single
         trades = run(bars, args.period, oversold, overbought, stop_pct, rr,
-                     args.breakeven_at, args.trail)
+                     args.breakeven_at, args.trail, costs)
         print("RSI(%d) %.0f/%.0f -- every trade:" % (args.period, oversold, overbought))
         print("")
         for t in trades:
@@ -307,9 +399,10 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
                      t.result_r, t.result_r * risk_cash))
         s = summarise(trades, days)
         print("")
-        print("  %d trades, %.1f/day, %d wins (%.0f%%), %d break-even, total %+.2fR = $%+.2f"
-              % (s["n"], s["per_day"], s["wins"], s["win_pct"], s["be"],
-                 s["total_r"], s["total_r"] * risk_cash))
+        print("  %d trades, %.1f/day, %d wins (%.0f%%), %d break-even, %d flattened, "
+              "financing %+.2fR, total %+.2fR = $%+.2f"
+              % (s["n"], s["per_day"], s["wins"], s["win_pct"], s["be"], s["flat"],
+                 s["fin_r"], s["total_r"], s["total_r"] * risk_cash))
         return
 
     if args.protect:
@@ -322,25 +415,26 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
         print("-" * 75)
         for label, be_at, tr in PROTECT_GRID:
             trades = run(bars, args.period, float(oversold), float(overbought),
-                         stop_pct, rr, be_at, tr)
+                         stop_pct, rr, be_at, tr, costs)
             s = summarise(trades, days)
             print("%-28s %6d %5.0f %6d %+7.2f %+8.2f %+9.2f"
                   % (label, s["n"], s["win_pct"], s["be"], s["avg_r"],
                      s["total_r"], s["total_r"] * risk_cash))
         return
 
-    print("%-12s %7s %8s %7s %9s %10s" %
-          ("RSI band", "trades", "per day", "win%", "total R", "P&L $"))
-    print("-" * 58)
+    print("%-12s %7s %8s %7s %6s %8s %9s %10s" %
+          ("RSI band", "trades", "per day", "win%", "flat", "fin R", "total R", "P&L $"))
+    print("-" * 74)
     for oversold, overbought in ((20, 80), (25, 75), (30, 70), (35, 65),
                                  (40, 60), (45, 55)):
         trades = run(bars, args.period, float(oversold), float(overbought),
-                     stop_pct, rr, args.breakeven_at, args.trail)
+                     stop_pct, rr, args.breakeven_at, args.trail, costs)
         s = summarise(trades, days)
         marker = "   <- live now" if (oversold, overbought) == live_band else ""
-        print("%-12s %7d %8.1f %7.0f %+9.2f %+10.2f%s"
+        print("%-12s %7d %8.1f %7.0f %6d %+8.2f %+9.2f %+10.2f%s"
               % ("%d/%d" % (oversold, overbought), s["n"], s["per_day"],
-                 s["win_pct"], s["total_r"], s["total_r"] * risk_cash, marker))
+                 s["win_pct"], s["flat"], s["fin_r"], s["total_r"],
+                 s["total_r"] * risk_cash, marker))
 
     print("")
     print("Trades go up as the band widens. Whether MONEY goes up is the")
@@ -368,6 +462,8 @@ def main() -> int:
                     help="trail the stop this many R behind the best price")
     ap.add_argument("--protect", action="store_true",
                     help="compare the protection rules on the live band")
+    ap.add_argument("--no-costs", action="store_true",
+                    help="ignore financing and weekend/overnight flattens (the pre-9-Sep model)")
     ap.add_argument("--single", nargs=2, type=float, metavar=("OVERSOLD", "OVERBOUGHT"),
                     help="test one threshold pair and print every trade")
     args = ap.parse_args()

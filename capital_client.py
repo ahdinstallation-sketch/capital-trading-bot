@@ -232,6 +232,12 @@ class CapitalClient:
     def positions(self) -> List[Dict[str, Any]]:
         return self._request("GET", "/api/v1/positions").get("positions", [])
 
+    def transactions(self, since_iso: str) -> List[Dict[str, Any]]:
+        """Account transactions (closed trades, financing, deposits) since a UTC ISO time."""
+        return self._request(
+            "GET", "/api/v1/history/transactions", params={"from": since_iso}
+        ).get("transactions", [])
+
     def open_position(
         self,
         epic: str,

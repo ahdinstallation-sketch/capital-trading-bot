@@ -76,7 +76,7 @@ jobs:
 
           # Comma-separated. Each instrument's stop and RSI band live in
           # bot.INSTRUMENTS; anything not listed there uses the fallbacks below.
-          CAPITAL_EPICS: ${{ vars.CAPITAL_EPICS || 'BTCUSD,EURUSD,GBPUSD,AUDUSD,USDJPY' }}
+          CAPITAL_EPICS: ${{ vars.CAPITAL_EPICS || 'EURUSD,GBPUSD,AUDUSD' }}
           # 4-hour candles: a 30-minute poll sees every candle at least eight
           # times, whereas 5-minute signals came and went between polls. It is
           # also the only resolution the broker gives 166 days of history for,
@@ -110,6 +110,14 @@ jobs:
           OVERNIGHT_HOLD_MIN_SIZE: "0"
           # Hold positions the broker PAYS you to carry; flatten the ones you pay for.
           HOLD_PAID_OVERNIGHT: "true"
+          OVERNIGHT_MAX_PAY_PCT: "0.02"
+          WEEKEND_FLATTEN: "true"
+          COOLDOWN_MINUTES: "240"
+          MAX_SAME_USD_SIDE: "2"
+          NEWS_FILTER: "true"
+          NEWS_BLACKOUT_MINUTES: "30"
+          KILL_AFTER_TRADES: "60"
+          KILL_BELOW_R: "-5"
         run: python bot.py --once
 
       - name: Upload log
