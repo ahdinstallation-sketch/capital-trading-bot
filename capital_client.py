@@ -23,6 +23,8 @@ LIVE_BASE = "https://api-capital.backend-capital.com"
 
 # A session token is good for ~10 minutes of inactivity. Refresh well before.
 SESSION_TTL_SECONDS = 540
+LOGIN_ATTEMPTS = 3
+LOGIN_BACKOFF = (15, 30)   # seconds; total 45s, well inside the 5-min job timeout
 
 
 class CapitalError(RuntimeError):
@@ -88,15 +90,26 @@ class CapitalClient:
     # ---------------------------------------------------------------- auth
 
     def login(self) -> None:
-        resp = self.session.post(
-            self.base_url + "/api/v1/session",
-            headers={
-                "X-CAP-API-KEY": self.api_key,
-                "Content-Type": "application/json",
-            },
-            json={"identifier": self.identifier, "password": self.password},
-            timeout=20,
-        )
+        # Capital.com rate-limits session creation. Two triggers landing a
+        # minute apart, or a batch of backtests, is enough to draw a 429.
+        # That is transient, so wait it out rather than fail the whole pass.
+        for attempt in range(1, LOGIN_ATTEMPTS + 1):
+            resp = self.session.post(
+                self.base_url + "/api/v1/session",
+                headers={
+                    "X-CAP-API-KEY": self.api_key,
+                    "Content-Type": "application/json",
+                },
+                json={"identifier": self.identifier, "password": self.password},
+                timeout=20,
+            )
+            if resp.status_code == 429 and attempt < LOGIN_ATTEMPTS:
+                wait = LOGIN_BACKOFF[min(attempt - 1, len(LOGIN_BACKOFF) - 1)]
+                log.warning("Login rate-limited (429), attempt %d/%d - retrying in %ds",
+                            attempt, LOGIN_ATTEMPTS, wait)
+                time.sleep(wait)
+                continue
+            break
         if resp.status_code != 200:
             raise CapitalError(
                 "Login failed (%s): %s" % (resp.status_code, resp.text[:300])
