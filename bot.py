@@ -608,6 +608,23 @@ def evaluate_epic(
     cfg = instrument_config(epic)
     stop_pct = float(cfg["stop_pct"])
 
+    # Ask the broker whether the market is open before reading a single
+    # candle. Over the first weekend the bot found a signal on Saturday,
+    # sent the order, and was refused every 30 minutes until Sunday night.
+    # Harmless, but an ERROR in every log and an alert attempt each time.
+    try:
+        info = cache.get(epic)
+        if info is None:
+            info = client.market(epic)
+            cache[epic] = info
+    except CapitalError as exc:
+        log.warning("%s: market lookup failed (%s) - skipping this pass", epic, exc)
+        return None
+    market_status = ((info.get("snapshot") or {}).get("marketStatus") or "").upper()
+    if market_status and market_status != "TRADEABLE":
+        log.info("%s: market is %s - skipping", epic, market_status)
+        return None
+
     closes = client.closes(epic, RESOLUTION, count=max(RSI_PERIOD * 4, 60))
     if len(closes) < 2:
         log.warning("%s: no price data", epic)
@@ -631,15 +648,11 @@ def evaluate_epic(
         return None
 
     try:
-        info = cache.get(epic)
-        if info is None:
-            info = client.market(epic)
-            cache[epic] = info
         rules = info.get("dealingRules", {})
         min_size = float(rules.get("minDealSize", {}).get("value", 0) or 0)
         step = float(rules.get("minSizeIncrement", {}).get("value", 0) or 0)
-    except (CapitalError, TypeError, ValueError):
-        info, min_size, step = {}, 0.0, 0.0
+    except (TypeError, ValueError):
+        min_size, step = 0.0, 0.0
 
     # Do not open something that the overnight routine would close within the
     # hour. Same decision function as the flatten, so they cannot disagree.
