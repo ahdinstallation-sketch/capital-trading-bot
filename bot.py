@@ -75,11 +75,20 @@ STOP_DISTANCE_PCT = float(os.getenv("STOP_DISTANCE_PCT", "1.0"))
 # 4-hour candles: 40/60 was positive on EURUSD/GBPUSD/AUDUSD, 30/70 was the
 # least-bad row on BTCUSD and USDJPY. ~100 trades each -- directional, not
 # proof of an edge. Re-run backtest.py before trusting any of these.
-INSTRUMENTS: Dict[str, Dict[str, float]] = {
+# "hours": UTC open-hours of the 4-hour bars this instrument may ENTER on --
+# its home session. This broker's 4-hour bars open at 02/06/10/14/18/22 UTC.
+# EUR and GBP trade the London day (06/10/14); AUD trades the Asia-Pacific
+# night (22/02/06). Intraday FX activity, volatility and spreads all follow
+# the home market's hours (Ito & Hashimoto 2006; Krohn et al. 2024), and on
+# 166 days of this account's own candles the rule lifted every pair --
+# EUR +$2 -> +$9, GBP +$14 -> +$20, AUD +$10 -> +$11 -- on 30% fewer trades.
+# Tested 26 Sep 2026; one rule for all pairs, not a per-pair fit. Absent =
+# any hour.
+INSTRUMENTS: Dict[str, Dict[str, Any]] = {
     "BTCUSD": {"stop_pct": 1.0,  "oversold": 30, "overbought": 70},
-    "EURUSD": {"stop_pct": 0.3,  "oversold": 40, "overbought": 60},
-    "GBPUSD": {"stop_pct": 0.25, "oversold": 40, "overbought": 60},
-    "AUDUSD": {"stop_pct": 0.3,  "oversold": 40, "overbought": 60},
+    "EURUSD": {"stop_pct": 0.3,  "oversold": 40, "overbought": 60, "hours": [6, 10, 14]},
+    "GBPUSD": {"stop_pct": 0.25, "oversold": 40, "overbought": 60, "hours": [6, 10, 14]},
+    "AUDUSD": {"stop_pct": 0.3,  "oversold": 40, "overbought": 60, "hours": [22, 2, 6]},
     "USDJPY": {"stop_pct": 0.3,  "oversold": 30, "overbought": 70},
 }
 # BTCUSD and USDJPY were removed 9 Sep 2026 (both negative in every backtest
@@ -104,7 +113,7 @@ def _epics_from_env() -> List[str]:
 EPICS = _epics_from_env()
 
 
-def instrument_config(epic: str) -> Dict[str, float]:
+def instrument_config(epic: str) -> Dict[str, Any]:
     cfg = INSTRUMENTS.get(epic.upper())
     if cfg:
         return cfg
@@ -195,8 +204,9 @@ NEWS_BLACKOUT_MINUTES = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 # reset it. Change STRATEGY_FROZEN_AT only when you change the strategy.
 # v1 (RSI only, frozen 9 Sep): 24 trades, -$9.23 = -6.9R by 26 Sep. Stopped.
 # v2 (RSI + ADX<25 stand-aside) never traded -- superseded the same morning.
-# v3 (RSI when ranging, with-the-trend when trending) frozen here.
-STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-09-26T10:00:00")
+# v3 (RSI when ranging, with-the-trend when trending) never traded either.
+# v4 = v3 + each pair enters only in its home session. Frozen here.
+STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-09-26T11:00:00")
 KILL_AFTER_TRADES = int(os.getenv("KILL_AFTER_TRADES", "60"))
 KILL_BELOW_R = float(os.getenv("KILL_BELOW_R", "-5"))
 
@@ -711,10 +721,23 @@ def evaluate_epic(
 
     # 200 bars: RSI needs 15, ADX needs ~30 plus warm-up for its smoothing to
     # settle to the same value the backtester (which sees 1,000) would hold.
-    closes, highs, lows = ohlc(client.candles(epic, RESOLUTION, count=200))
+    candles = client.candles(epic, RESOLUTION, count=200)
+    closes, highs, lows = ohlc(candles)
     if len(closes) < 2:
         log.warning("%s: no price data", epic)
         return None
+
+    # Home session: the bar we would enter on is the one still forming.
+    hours = cfg.get("hours")
+    if hours:
+        try:
+            bar_hour = int((candles[-1].get("snapshotTime") or "")[11:13])
+        except ValueError:
+            bar_hour = -1
+        if bar_hour not in hours:
+            log.info("%s: outside home session (bar opened %02d:00 UTC, trades on %s) - not entering",
+                     epic, bar_hour, "/".join("%02d" % h for h in hours))
+            return None
 
     # The last candle the broker returns is the one still forming. Deciding on
     # it means the RSI repaints eight times inside a 4-hour bar and the bot
