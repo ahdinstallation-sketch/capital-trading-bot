@@ -51,6 +51,18 @@ RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 ADX_PERIOD = 14
 REGIME_ADX_MAX = float(os.getenv("REGIME_ADX_MAX", "25"))   # 0 disables the filter
 
+# What to do when ADX says the market is TRENDING (>= REGIME_ADX_MAX).
+#   aside   stand aside until it ranges again (v2, 26 Sep morning)
+#   invert  trade WITH the trend: an RSI "oversold" reading in a downtrend
+#           is weakness to sell, not a dip to buy, and vice versa. Direction
+#           comes from +DI vs -DI. (v3, 26 Sep, at Ahmed's instruction:
+#           "if it's quiet because the trend is reversing it should take the
+#           opposite trade".) Backtested 166d with costs: same total as
+#           standing aside (+$26 vs +$24) on twice the trades, and +$13
+#           over 12-26 Sep where v1 lost $22 and v2 sat out. Same 1.5:1
+#           target as ranging trades -- one fewer parameter to have fitted.
+TREND_MODE = os.getenv("TREND_MODE", "invert").strip().lower()
+
 # Fallbacks for any epic not in INSTRUMENTS below.
 RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30"))
 RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "70"))
@@ -182,8 +194,9 @@ NEWS_BLACKOUT_MINUTES = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 # Rebuilt from the broker's own history every pass, so a lost cache cannot
 # reset it. Change STRATEGY_FROZEN_AT only when you change the strategy.
 # v1 (RSI only, frozen 9 Sep): 24 trades, -$9.23 = -6.9R by 26 Sep. Stopped.
-# v2 (RSI + ADX<25 regime filter) frozen here. New count, new test.
-STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-09-26T12:00:00")
+# v2 (RSI + ADX<25 stand-aside) never traded -- superseded the same morning.
+# v3 (RSI when ranging, with-the-trend when trending) frozen here.
+STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-09-26T10:00:00")
 KILL_AFTER_TRADES = int(os.getenv("KILL_AFTER_TRADES", "60"))
 KILL_BELOW_R = float(os.getenv("KILL_BELOW_R", "-5"))
 
@@ -231,15 +244,17 @@ def rsi(values: List[float], period: int = 14) -> Optional[float]:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def adx_series(highs: List[float], lows: List[float], closes: List[float], n: int = 14
-               ) -> List[Optional[float]]:
+def dmi_series(highs: List[float], lows: List[float], closes: List[float], n: int = 14
+               ) -> Tuple[List[Optional[float]], List[Optional[float]], List[Optional[float]]]:
     """
-    Wilder's ADX at every bar. High = trending, low = ranging. Shared with
-    backtest.py so the filter the bot applies is the filter that was tested.
+    Wilder's directional movement at every bar: (ADX, +DI, -DI). ADX is trend
+    STRENGTH regardless of direction; +DI > -DI says the trend is up, -DI > +DI
+    says down. Shared with backtest.py so the tested rule is the running rule.
     """
-    out: List[Optional[float]] = [None] * len(closes)
+    empty: List[Optional[float]] = [None] * len(closes)
     if len(closes) < 2 * n + 1:
-        return out
+        return empty, list(empty), list(empty)
+    adx_out, pdi_out, mdi_out = list(empty), list(empty), list(empty)
     tr, pdm, mdm = [], [], []
     for i in range(1, len(closes)):
         up, dn = highs[i] - highs[i - 1], lows[i - 1] - lows[i]
@@ -255,6 +270,7 @@ def adx_series(highs: List[float], lows: List[float], closes: List[float], n: in
         spdm = spdm - spdm / n + pdm[i]
         smdm = smdm - smdm / n + mdm[i]
         pdi, mdi = (100 * spdm / atr if atr else 0.0), (100 * smdm / atr if atr else 0.0)
+        pdi_out[i + 1], mdi_out[i + 1] = pdi, mdi
         dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0.0
         dxs.append(dx)
         if len(dxs) == n:
@@ -263,8 +279,13 @@ def adx_series(highs: List[float], lows: List[float], closes: List[float], n: in
             adx = (adx * (n - 1) + dx) / n
         else:
             continue
-        out[i + 1] = adx
-    return out
+        adx_out[i + 1] = adx
+    return adx_out, pdi_out, mdi_out
+
+
+def adx_series(highs: List[float], lows: List[float], closes: List[float], n: int = 14
+               ) -> List[Optional[float]]:
+    return dmi_series(highs, lows, closes, n)[0]
 
 
 def ohlc(candles: List[Dict[str, Any]]) -> Tuple[List[float], List[float], List[float]]:
@@ -706,15 +727,31 @@ def evaluate_epic(
         return None
 
     if REGIME_ADX_MAX > 0:
-        adx = adx_series(highs[:-1], lows[:-1], completed, ADX_PERIOD)[-1]
-        if adx is None:
+        adx_s, pdi_s, mdi_s = dmi_series(highs[:-1], lows[:-1], completed, ADX_PERIOD)
+        adx, pdi, mdi = adx_s[-1], pdi_s[-1], mdi_s[-1]
+        if adx is None or pdi is None or mdi is None:
             log.info("%s: %s signal ignored - not enough bars for ADX(%d)", epic, direction, ADX_PERIOD)
             return None
-        if adx >= REGIME_ADX_MAX:
+        if adx < REGIME_ADX_MAX:
+            log.info("%s: ADX(%d) = %.1f - ranging; fading the move: %s", epic, ADX_PERIOD, adx, direction)
+        elif TREND_MODE == "invert":
+            trend = "UP" if pdi > mdi else "DOWN"
+            with_trend = "BUY" if trend == "UP" else "SELL"
+            if direction == with_trend:
+                # RSI is stretched in the trend's own direction (overbought in
+                # an uptrend). Not weakness to sell, not a pullback to buy.
+                log.info("%s: %s signal ignored - ADX(%d) = %.1f, trend %s (+DI %.0f / -DI %.0f); "
+                         "RSI is stretched with the trend, nothing to do",
+                         epic, direction, ADX_PERIOD, adx, trend, pdi, mdi)
+                return None
+            log.info("%s: ADX(%d) = %.1f, trend %s (+DI %.0f / -DI %.0f) - RSI says %s against it; "
+                     "trading WITH the trend instead: %s",
+                     epic, ADX_PERIOD, adx, trend, pdi, mdi, direction, with_trend)
+            direction = with_trend
+        else:
             log.info("%s: %s signal ignored - ADX(%d) = %.1f, market is trending (limit %.0f); "
-                     "mean reversion stands aside", epic, direction, ADX_PERIOD, adx, REGIME_ADX_MAX)
+                     "standing aside (TREND_MODE=%s)", epic, direction, ADX_PERIOD, adx, REGIME_ADX_MAX, TREND_MODE)
             return None
-        log.info("%s: ADX(%d) = %.1f - ranging, rule may trade", epic, ADX_PERIOD, adx)
 
     side = usd_side(epic, direction)
     if side and usd_exposure.get(side, 0) >= MAX_SAME_USD_SIDE:
@@ -830,6 +867,9 @@ def evaluate_epic(
         "",
         "RSI(%d)  %.1f  (band %.0f/%.0f)"
         % (RSI_PERIOD, rsi(completed, RSI_PERIOD) or 0.0, cfg["oversold"], cfg["overbought"]),
+        "ADX(%d)  %s  (%s)" % (ADX_PERIOD,
+                               "n/a" if REGIME_ADX_MAX <= 0 else "%.1f" % (adx_series(highs[:-1], lows[:-1], completed, ADX_PERIOD)[-1] or 0.0),
+                               "ranging - fading the move" if REGIME_ADX_MAX <= 0 or (adx_series(highs[:-1], lows[:-1], completed, ADX_PERIOD)[-1] or 0.0) < REGIME_ADX_MAX else "trending - with the trend"),
         "account  %s" % ("DEMO" if client.is_demo else "LIVE"),
     ]
 

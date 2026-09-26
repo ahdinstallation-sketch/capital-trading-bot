@@ -94,6 +94,7 @@ jobs:
           # Daily analyst (analyst.py). Unset = the analyst quietly skips.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REGIME_ADX_MAX: "25"
+          TREND_MODE: "invert"
 
           # With five instruments the 3% daily halt (three stopped trades) is
           # the brake that keeps "more trades" from becoming "more losses in

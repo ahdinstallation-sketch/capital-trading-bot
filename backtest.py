@@ -40,7 +40,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from capital_client import CapitalClient, CapitalError
-from bot import INSTRUMENTS, instrument_config, OVERNIGHT_MAX_PAY_PCT, REGIME_ADX_MAX, adx_series
+from bot import INSTRUMENTS, instrument_config, OVERNIGHT_MAX_PAY_PCT, REGIME_ADX_MAX, TREND_MODE, adx_series, dmi_series
 
 
 # ------------------------------------------------------------------ helpers
@@ -164,7 +164,9 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
         trail: Optional[float] = None,
         costs: Optional[Costs] = None,
         regime: Optional[str] = None,
-        since: Optional[dt.datetime] = None) -> List[Trade]:
+        since: Optional[dt.datetime] = None,
+        trend_mode: Optional[str] = None,
+        trend_rr: Optional[float] = None) -> List[Trade]:
     """
     Walk the candles once, left to right, opening and closing trades exactly
     the way bot.py would. No lookahead: the decision at bar i uses only
@@ -184,8 +186,16 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
     # toward the 50-bar mean, i.e. BUY only above SMA50, SELL only below.
     # "both": both conditions.
     sma50 = sma_series(closes, 50)
-    adx14 = adx_series([(b.bid_high + b.ask_high) / 2 for b in bars],
-                       [(b.bid_low + b.ask_low) / 2 for b in bars], closes, 14)
+    adx14, pdi, mdi = dmi_series([(b.bid_high + b.ask_high) / 2 for b in bars],
+                                 [(b.bid_low + b.ask_low) / 2 for b in bars], closes, 14)
+    # trend_mode: what to do when ADX says the market is TRENDING (>= limit).
+    #   None       stand aside (v2)
+    #   "invert"   take the RSI signal the other way round, with the trend:
+    #              RSI oversold in a downtrend = SELL (sell weakness), and v.v.
+    #   "pullback" enter with the trend when RSI pulls back to the middle:
+    #              downtrend and RSI >= 50 = SELL; uptrend and RSI <= 50 = BUY.
+    # Trend direction = which of +DI / -DI is bigger. trend_rr overrides the
+    # reward-to-risk on trend trades (they are expected to run further).
 
     trades: List[Trade] = []
     open_trade: Optional[Trade] = None
@@ -272,14 +282,38 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
             continue
         if since is not None and bars[i].ts < since:
             continue
-        if value <= oversold:
-            side = "BUY"
-        elif value >= overbought:
-            side = "SELL"
+        rr_here = reward_to_risk
+        trending = (regime in ("adx", "both")) and (adx14[i] is None or adx14[i] >= (REGIME_ADX_MAX or 25))
+        if trending and trend_mode:
+            if pdi[i] is None or mdi[i] is None:
+                continue
+            up = pdi[i] > mdi[i]
+            if trend_mode == "invert":
+                if value <= oversold and not up:
+                    side = "SELL"
+                elif value >= overbought and up:
+                    side = "BUY"
+                else:
+                    continue
+            elif trend_mode == "pullback":
+                if not up and value >= 50:
+                    side = "SELL"
+                elif up and value <= 50:
+                    side = "BUY"
+                else:
+                    continue
+            else:
+                continue
+            if trend_rr:
+                rr_here = trend_rr
         else:
-            continue
-        if regime in ("adx", "both"):
-            if adx14[i] is None or adx14[i] >= (REGIME_ADX_MAX or 25):
+            if value <= oversold:
+                side = "BUY"
+            elif value >= overbought:
+                side = "SELL"
+            else:
+                continue
+            if trending:
                 continue
         if regime in ("sma", "both"):
             if sma50[i] is None:
@@ -294,11 +328,11 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
         if side == "BUY":
             t.entry = nxt.ask_open           # we buy at the ask
             t.stop0 = t.entry * (1 - stop_pct / 100.0)
-            t.target = t.entry * (1 + stop_pct * reward_to_risk / 100.0)
+            t.target = t.entry * (1 + stop_pct * rr_here / 100.0)
         else:
             t.entry = nxt.bid_open           # we sell at the bid
             t.stop0 = t.entry * (1 + stop_pct / 100.0)
-            t.target = t.entry * (1 - stop_pct * reward_to_risk / 100.0)
+            t.target = t.entry * (1 - stop_pct * rr_here / 100.0)
         t.stop = t.stop0
         t.best = None
         t.fin_r = 0.0
@@ -423,7 +457,7 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
     if args.single:
         oversold, overbought = args.single
         trades = run(bars, args.period, oversold, overbought, stop_pct, rr,
-                     args.breakeven_at, args.trail, costs, live_regime, since)
+                     args.breakeven_at, args.trail, costs, live_regime, since, live_trend)
         print("RSI(%d) %.0f/%.0f -- every trade:" % (args.period, oversold, overbought))
         print("")
         for t in trades:
@@ -441,10 +475,34 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
     since = dt.datetime.strptime(args.since, "%Y-%m-%d") if args.since else None
     # Default regime = whatever bot.py runs, so a plain run scores the live strategy.
     live_regime = None if (args.no_regime or REGIME_ADX_MAX <= 0) else "adx"
+    live_trend = TREND_MODE if (live_regime and TREND_MODE == "invert") else None
     if live_regime:
-        print("regime     ADX(14) < %.0f required to open (bot.py setting; --no-regime to drop)" % REGIME_ADX_MAX)
+        print("regime     ADX(14) < %.0f = fade the move; >= %.0f = %s  (bot.py; --no-regime for v1)"
+              % (REGIME_ADX_MAX, REGIME_ADX_MAX, "trade WITH the trend" if live_trend else "stand aside"))
     else:
         print("regime     none")
+    if args.trend:
+        oversold, overbought = live_band
+        print("RSI(%d) %d/%d, ranging = mean reversion; what to do when ADX >= %.0f%s:"
+              % (args.period, oversold, overbought, REGIME_ADX_MAX or 25,
+                 " (entries since %s)" % args.since if args.since else ""))
+        print("")
+        print("%-34s %6s %5s %7s %8s %9s" % ("trending-market rule", "trades", "win%", "avg R", "total R", "P&L $"))
+        print("-" * 76)
+        for label, tm, trr in (("stand aside (v2)", None, None),
+                               ("v1: fade it anyway (no filter)", "V1", None),
+                               ("invert: sell weakness, RR 1.5 (v3 live)", "invert", None),
+                               ("invert: sell weakness, RR 2.0", "invert", 2.0),
+                               ("pullback: sell RSI>=50, RR 1.5", "pullback", None),
+                               ("pullback: sell RSI>=50, RR 2.0", "pullback", 2.0)):
+            if tm == "V1":
+                trades = run(bars, args.period, float(oversold), float(overbought), stop_pct, rr, None, None, costs, None, since)
+            else:
+                trades = run(bars, args.period, float(oversold), float(overbought), stop_pct, rr, None, None, costs, "adx", since, tm, trr)
+            s = summarise(trades, days)
+            print("%-34s %6d %5.0f %+7.2f %+8.2f %+9.2f" % (label, s["n"], s["win_pct"], s["avg_r"], s["total_r"], s["total_r"] * risk_cash))
+        return
+
     if args.regime:
         oversold, overbought = live_band
         print("RSI(%d) %d/%d -- regime filters%s:" % (args.period, oversold, overbought,
@@ -471,7 +529,7 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
         print("-" * 75)
         for label, be_at, tr in PROTECT_GRID:
             trades = run(bars, args.period, float(oversold), float(overbought),
-                         stop_pct, rr, be_at, tr, costs, live_regime, since)
+                         stop_pct, rr, be_at, tr, costs, live_regime, since, live_trend)
             s = summarise(trades, days)
             print("%-28s %6d %5.0f %6d %+7.2f %+8.2f %+9.2f"
                   % (label, s["n"], s["win_pct"], s["be"], s["avg_r"],
@@ -484,7 +542,7 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
     for oversold, overbought in ((20, 80), (25, 75), (30, 70), (35, 65),
                                  (40, 60), (45, 55)):
         trades = run(bars, args.period, float(oversold), float(overbought),
-                     stop_pct, rr, args.breakeven_at, args.trail, costs, live_regime, since)
+                     stop_pct, rr, args.breakeven_at, args.trail, costs, live_regime, since, live_trend)
         s = summarise(trades, days)
         marker = "   <- live now" if (oversold, overbought) == live_band else ""
         print("%-12s %7d %8.1f %7.0f %6d %+8.2f %+9.2f %+10.2f%s"
@@ -520,6 +578,8 @@ def main() -> int:
                     help="compare the protection rules on the live band")
     ap.add_argument("--regime", action="store_true",
                     help="compare regime filters (none / adx / sma50 side / both) on the live band")
+    ap.add_argument("--trend", action="store_true",
+                    help="compare what to do in a TRENDING market: stand aside / invert / pullback, at 1.5 and 2.0 RR")
     ap.add_argument("--no-regime", action="store_true",
                     help="ignore the ADX filter bot.py applies (the pre-26-Sep strategy)")
     ap.add_argument("--since", default=None, metavar="YYYY-MM-DD",
