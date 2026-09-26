@@ -168,7 +168,8 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
         trend_mode: Optional[str] = None,
         trend_rr: Optional[float] = None,
         hours: Optional[List[int]] = None,
-        atr_max_pctile: Optional[float] = None) -> List[Trade]:
+        atr_max_pctile: Optional[float] = None,
+        strategy: str = "rsi") -> List[Trade]:
     """
     Walk the candles once, left to right, opening and closing trades exactly
     the way bot.py would. No lookahead: the decision at bar i uses only
@@ -188,6 +189,7 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
     # toward the 50-bar mean, i.e. BUY only above SMA50, SELL only below.
     # "both": both conditions.
     sma50 = sma_series(closes, 50)
+    sma200 = sma_series(closes, 200)
     # ATR(14) percentile over the trailing 200 bars: a volatility-regime gauge.
     trs = [0.0] + [max(bars[i].ask_high - bars[i].bid_low, abs(bars[i].ask_high - closes[i - 1]),
                        abs(bars[i].bid_low - closes[i - 1])) for i in range(1, len(bars))]
@@ -224,8 +226,12 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
     for i in range(len(bars) - 1):
         nxt = bars[i + 1]
         # Last bar before a gap of 8h+ = Friday close (or a holiday).
+        # A gap is anything longer than 1.5 bars (min 8h): the Friday close on
+        # 4-hour bars, the weekend on daily bars. (Daily bars are 24h apart,
+        # so a fixed 8h threshold flagged every bar as pre-gap -- zero trades.)
+        gap_min = max(8 * 60, int(1.5 * costs.bar_minutes))
         before_gap = (costs.weekend_close and i + 2 < len(bars)
-                      and (bars[i + 2].ts - nxt.ts) > dt.timedelta(hours=8))
+                      and (bars[i + 2].ts - nxt.ts) > dt.timedelta(minutes=gap_min))
 
         # --- manage the open position first; one position at a time
         if open_trade is not None:
@@ -302,6 +308,25 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
             if window and sum(1 for x in window if x <= atr[i]) / len(window) * 100 > atr_max_pctile:
                 continue
         rr_here = reward_to_risk
+        if strategy != "rsi":
+            side = _alt_signal(strategy, bars, closes, sma50, sma200, atr, i)
+            if side is None:
+                continue
+            rr_here = 2.0 if strategy in ("vcp", "donchian") else reward_to_risk
+            t = Trade()
+            t.side = side
+            if side == "BUY":
+                t.entry = nxt.ask_open
+                t.stop0 = t.entry * (1 - stop_pct / 100.0)
+                t.target = t.entry * (1 + stop_pct * rr_here / 100.0)
+            else:
+                t.entry = nxt.bid_open
+                t.stop0 = t.entry * (1 + stop_pct / 100.0)
+                t.target = t.entry * (1 - stop_pct * rr_here / 100.0)
+            t.stop, t.best, t.fin_r = t.stop0, None, 0.0
+            t.opened, t.opened_idx, t.outcome, t.result_r = nxt.time, i + 1, "OPEN", 0.0
+            open_trade = t
+            continue
         trending = (regime in ("adx", "both")) and (adx14[i] is None or adx14[i] >= (REGIME_ADX_MAX or 25))
         if trending and trend_mode:
             if pdi[i] is None or mdi[i] is None:
@@ -362,6 +387,90 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
         open_trade = t
 
     return trades
+
+
+def _alt_signal(strategy: str, bars, closes, sma50, sma200, atr, i) -> Optional[str]:
+    """
+    Faithful, volume-free translations of the plugin rules (FX CFDs have no
+    real volume, so every volume condition is dropped):
+
+    vcp      Minervini / tradermonty vcp-screener: Stage-2 uptrend (close >
+             SMA50 > SMA200), a base whose last contraction's range is <= 0.7x
+             the prior contraction's (contraction-ratio 0.70, min 5 bars each),
+             entry when price clears the base pivot (highest high of the base).
+             Long only, as the skill is. Target 2R (breakout-trade-planner).
+    burst    Stockbee momentum burst: range expansion -- this bar's range
+             exceeds each of the prior three, close in the top quarter of the
+             bar, prior three bars quiet (each range < the 20-bar average).
+             The "4% day" is a stock number; range expansion is the FX-scale
+             equivalent. Long on up-bursts, short on down-bursts.
+    donchian Generic breakout benchmark: close above the prior 20-bar high ->
+             long; below the prior 20-bar low -> short. Target 2R.
+    cycle    cyclebottom-risk: log deviation of price from its 365-bar mean,
+             scored against its own history; buy when in the bottom decile
+             ("accumulation"), sell when in the top decile ("distribution").
+             Mean reversion at the slow scale.
+    """
+    if i < 30:
+        return None
+    hi = lambda k: (bars[k].bid_high + bars[k].ask_high) / 2
+    lo = lambda k: (bars[k].bid_low + bars[k].ask_low) / 2
+    if strategy == "donchian":
+        if i < 21:
+            return None
+        ph = max(hi(k) for k in range(i - 20, i)); pl = min(lo(k) for k in range(i - 20, i))
+        if closes[i] > ph:
+            return "BUY"
+        if closes[i] < pl:
+            return "SELL"
+        return None
+    if strategy == "burst":
+        if i < 21:
+            return None
+        rng = lambda k: hi(k) - lo(k)
+        avg20 = sum(rng(k) for k in range(i - 20, i)) / 20
+        if not all(rng(i) > rng(k) for k in (i - 1, i - 2, i - 3)):
+            return None
+        if not all(rng(k) < avg20 for k in (i - 1, i - 2, i - 3)):
+            return None
+        r = rng(i)
+        if r <= 0:
+            return None
+        pos = (closes[i] - lo(i)) / r
+        if pos >= 0.75 and closes[i] > closes[i - 1]:
+            return "BUY"
+        if pos <= 0.25 and closes[i] < closes[i - 1]:
+            return "SELL"
+        return None
+    if strategy == "vcp":
+        if sma200[i] is None or not (closes[i] > sma50[i] > sma200[i]):
+            return None
+        # base = last 20 bars; split into two 10-bar contractions
+        c2 = range(i - 9, i + 1); c1 = range(i - 19, i - 9)
+        r1 = max(hi(k) for k in c1) - min(lo(k) for k in c1)
+        r2 = max(hi(k) for k in c2) - min(lo(k) for k in c2)
+        if r1 <= 0 or r2 / r1 > 0.70:
+            return None
+        pivot = max(hi(k) for k in range(i - 19, i))   # base high excluding this bar
+        if closes[i] > pivot and closes[i - 1] <= pivot:
+            return "BUY"
+        return None
+    if strategy == "cycle":
+        n = 365 if len(bars) > 400 else 200
+        if i < n + 50:
+            return None
+        import math
+        devs = []
+        for k in range(i - 250, i + 1):
+            m = sum(closes[j] for j in range(k - n + 1, k + 1)) / n
+            devs.append(math.log(closes[k] / m))
+        cur = devs[-1]; srt = sorted(devs)
+        if cur <= srt[int(0.10 * len(srt))]:
+            return "BUY"
+        if cur >= srt[int(0.90 * len(srt))]:
+            return "SELL"
+        return None
+    return None
 
 
 def summarise(trades: List[Trade], days: float) -> Dict[str, Any]:
@@ -493,7 +602,8 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
 
     since = dt.datetime.strptime(args.since, "%Y-%m-%d") if args.since else None
     # Default regime = whatever bot.py runs, so a plain run scores the live strategy.
-    live_hours = None if args.no_regime else live_cfg.get("hours")
+    # The home-session hours are defined on this broker's 4-hour bars only.
+    live_hours = None if (args.no_regime or args.resolution != "HOUR_4") else live_cfg.get("hours")
     if live_hours:
         print("session    entries only on bars opening %s UTC (bot.py; the pair's home session)"
               % "/".join("%02d" % h for h in live_hours))
@@ -504,6 +614,24 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
               % (REGIME_ADX_MAX, REGIME_ADX_MAX, "trade WITH the trend" if live_trend else "stand aside"))
     else:
         print("regime     none")
+    if args.plugins:
+        oversold, overbought = live_band
+        print("Plugin rules vs the live rule, same stop (%.2f%%), same costs%s:" % (stop_pct, " (entries since %s)" % args.since if args.since else ""))
+        print("")
+        print("%-44s %6s %5s %7s %8s %9s" % ("rule", "trades", "win%", "avg R", "total R", "P&L $"))
+        print("-" * 86)
+        for label, strat in (("v4 live (RSI + ADX regime + home session)", "rsi"),
+                             ("Minervini VCP breakout (vcp-screener), long only", "vcp"),
+                             ("Stockbee momentum burst (range expansion)", "burst"),
+                             ("Donchian 20-bar breakout", "donchian"),
+                             ("cyclebottom: deviation from long mean", "cycle")):
+            trades = run(bars, args.period, float(oversold), float(overbought), stop_pct, rr, None, None,
+                         costs, live_regime if strat == "rsi" else None, since, live_trend if strat == "rsi" else None,
+                         None, live_hours if strat == "rsi" else None, None, strat)
+            s = summarise(trades, days)
+            print("%-44s %6d %5.0f %+7.2f %+8.2f %+9.2f" % (label, s["n"], s["win_pct"], s["avg_r"], s["total_r"], s["total_r"] * risk_cash))
+        return
+
     if args.filters:
         oversold, overbought = live_band
         print("Live strategy (v3) with extra entry filters%s:" % (" (entries since %s)" % args.since if args.since else ""))
@@ -625,6 +753,8 @@ def main() -> int:
                     help="compare regime filters (none / adx / sma50 side / both) on the live band")
     ap.add_argument("--trend", action="store_true",
                     help="compare what to do in a TRENDING market: stand aside / invert / pullback, at 1.5 and 2.0 RR")
+    ap.add_argument("--plugins", action="store_true",
+                    help="score the trading-plugin rules (VCP, momentum burst, Donchian, cycle) against the live rule")
     ap.add_argument("--filters", action="store_true",
                     help="on the live strategy, compare entry-hour and volatility filters")
     ap.add_argument("--no-regime", action="store_true",
