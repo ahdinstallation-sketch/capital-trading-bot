@@ -40,6 +40,17 @@ RESOLUTION = os.getenv("CAPITAL_RESOLUTION", "MINUTE_5")
 
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 
+# ---- regime filter (added 26 Sep 2026)
+# Mean reversion has exactly one precondition: a market that is reverting.
+# 12-26 Sep 2026 EUR, GBP and AUD all fell 2% in a straight line; RSI sat
+# under 40 the whole way and the bot bought nineteen dips in a row, every
+# one a new low. 19 losses, -6.9R. ADX(14) measures trend strength; the
+# textbook cut-off is 25 and it is used here untuned. Below it the rule
+# trades, above it the bot stands aside. Over the same 166 days this
+# halves the trade count and removes the losing fortnight entirely.
+ADX_PERIOD = 14
+REGIME_ADX_MAX = float(os.getenv("REGIME_ADX_MAX", "25"))   # 0 disables the filter
+
 # Fallbacks for any epic not in INSTRUMENTS below.
 RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30"))
 RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "70"))
@@ -170,7 +181,9 @@ NEWS_BLACKOUT_MINUTES = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 # changes this line. Decide the exit before the entry -- for the system too.
 # Rebuilt from the broker's own history every pass, so a lost cache cannot
 # reset it. Change STRATEGY_FROZEN_AT only when you change the strategy.
-STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-09-09T08:00:00")
+# v1 (RSI only, frozen 9 Sep): 24 trades, -$9.23 = -6.9R by 26 Sep. Stopped.
+# v2 (RSI + ADX<25 regime filter) frozen here. New count, new test.
+STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-09-26T12:00:00")
 KILL_AFTER_TRADES = int(os.getenv("KILL_AFTER_TRADES", "60"))
 KILL_BELOW_R = float(os.getenv("KILL_BELOW_R", "-5"))
 
@@ -216,6 +229,56 @@ def rsi(values: List[float], period: int = 14) -> Optional[float]:
         return 100.0
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
+
+
+def adx_series(highs: List[float], lows: List[float], closes: List[float], n: int = 14
+               ) -> List[Optional[float]]:
+    """
+    Wilder's ADX at every bar. High = trending, low = ranging. Shared with
+    backtest.py so the filter the bot applies is the filter that was tested.
+    """
+    out: List[Optional[float]] = [None] * len(closes)
+    if len(closes) < 2 * n + 1:
+        return out
+    tr, pdm, mdm = [], [], []
+    for i in range(1, len(closes)):
+        up, dn = highs[i] - highs[i - 1], lows[i - 1] - lows[i]
+        pdm.append(up if up > dn and up > 0 else 0.0)
+        mdm.append(dn if dn > up and dn > 0 else 0.0)
+        tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                      abs(lows[i] - closes[i - 1])))
+    atr, spdm, smdm = sum(tr[:n]), sum(pdm[:n]), sum(mdm[:n])
+    dxs: List[float] = []
+    adx = 0.0
+    for i in range(n, len(tr)):
+        atr = atr - atr / n + tr[i]
+        spdm = spdm - spdm / n + pdm[i]
+        smdm = smdm - smdm / n + mdm[i]
+        pdi, mdi = (100 * spdm / atr if atr else 0.0), (100 * smdm / atr if atr else 0.0)
+        dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0.0
+        dxs.append(dx)
+        if len(dxs) == n:
+            adx = sum(dxs) / n
+        elif len(dxs) > n:
+            adx = (adx * (n - 1) + dx) / n
+        else:
+            continue
+        out[i + 1] = adx
+    return out
+
+
+def ohlc(candles: List[Dict[str, Any]]) -> Tuple[List[float], List[float], List[float]]:
+    """Mid closes, highs and lows, oldest first. Skips incomplete candles."""
+    closes, highs, lows = [], [], []
+    for c in candles:
+        try:
+            cl, hi, lo = c["closePrice"], c["highPrice"], c["lowPrice"]
+            closes.append((float(cl["bid"]) + float(cl["ask"])) / 2.0)
+            highs.append((float(hi["bid"]) + float(hi["ask"])) / 2.0)
+            lows.append((float(lo["bid"]) + float(lo["ask"])) / 2.0)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return closes, highs, lows
 
 
 # --------------------------------------------------------------------- state
@@ -625,7 +688,9 @@ def evaluate_epic(
         log.info("%s: market is %s - skipping", epic, market_status)
         return None
 
-    closes = client.closes(epic, RESOLUTION, count=max(RSI_PERIOD * 4, 60))
+    # 200 bars: RSI needs 15, ADX needs ~30 plus warm-up for its smoothing to
+    # settle to the same value the backtester (which sees 1,000) would hold.
+    closes, highs, lows = ohlc(client.candles(epic, RESOLUTION, count=200))
     if len(closes) < 2:
         log.warning("%s: no price data", epic)
         return None
@@ -639,6 +704,17 @@ def evaluate_epic(
     if not direction:
         log.info("%s: no signal", epic)
         return None
+
+    if REGIME_ADX_MAX > 0:
+        adx = adx_series(highs[:-1], lows[:-1], completed, ADX_PERIOD)[-1]
+        if adx is None:
+            log.info("%s: %s signal ignored - not enough bars for ADX(%d)", epic, direction, ADX_PERIOD)
+            return None
+        if adx >= REGIME_ADX_MAX:
+            log.info("%s: %s signal ignored - ADX(%d) = %.1f, market is trending (limit %.0f); "
+                     "mean reversion stands aside", epic, direction, ADX_PERIOD, adx, REGIME_ADX_MAX)
+            return None
+        log.info("%s: ADX(%d) = %.1f - ranging, rule may trade", epic, ADX_PERIOD, adx)
 
     side = usd_side(epic, direction)
     if side and usd_exposure.get(side, 0) >= MAX_SAME_USD_SIDE:

@@ -29,7 +29,9 @@ concurrency:
 jobs:
   evaluate:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
+    permissions:
+      contents: write     # the analyst's report is committed back to the repo
 
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +40,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: pip install --quiet requests
+      - run: pip install --quiet requests anthropic
 
       # The daily-loss limit needs to remember today's starting balance across
       # runs. Each Actions run is a fresh container, so state.json is carried
@@ -89,6 +91,10 @@ jobs:
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           ALERT_RECIPIENTS: ${{ vars.ALERT_RECIPIENTS }}
 
+          # Daily analyst (analyst.py). Unset = the analyst quietly skips.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REGIME_ADX_MAX: "25"
+
           # With five instruments the 3% daily halt (three stopped trades) is
           # the brake that keeps "more trades" from becoming "more losses in
           # one day". Do not loosen it to get more activity.
@@ -118,7 +124,23 @@ jobs:
           NEWS_BLACKOUT_MINUTES: "30"
           KILL_AFTER_TRADES: "60"
           KILL_BELOW_R: "-5"
-        run: python bot.py --once
+        run: |
+          python bot.py --once
+          # The analyst writes reports/YYYY-MM-DD.md once a day after 21:00
+          # UTC. It can never fail the trading job.
+          python analyst.py --if-due || echo "analyst failed (non-fatal)"
+
+      - name: Commit the analyst's report
+        if: ${{ !inputs.test_mail }}
+        continue-on-error: true
+        run: |
+          if [ -n "$(git status --porcelain reports)" ]; then
+            git config user.name "trading-bot"
+            git config user.email "trading-bot@users.noreply.github.com"
+            git add reports
+            git commit -q -m "Analyst report $(date -u +%F)"
+            git push -q
+          fi
 
       - name: Upload log
         if: always()
