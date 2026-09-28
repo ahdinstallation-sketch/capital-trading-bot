@@ -1,0 +1,34 @@
+name: checks
+
+# The rule's own tests, on every push. No secrets, no network, no broker: this
+# workflow cannot touch the account and cannot be broken by capital.com being
+# down. It exists to catch the one class of bug that has cost this project the
+# most -- the live rule and the backtested rule quietly drifting apart, which
+# is what left v2 and v3 backtested but never trading.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The suite is hermetic, but the modules it imports are not: bot.py and
+      # analyst.py import capital_client, which imports requests.
+      - run: pip install --quiet requests
+
+      - name: Rule, brake, watchdog and report tests
+        run: python -m unittest discover -s tests -v
+
+      # A syntax error in the trading loop must never reach a live run, so
+      # compile everything even though the tests only import some of it.
+      - name: Byte-compile every module
+        run: python -m compileall -q bot.py backtest.py analyst.py notify.py news.py capital_client.py

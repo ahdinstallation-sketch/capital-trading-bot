@@ -28,7 +28,7 @@ import logging
 import math
 import argparse
 import datetime as dt
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from capital_client import CapitalClient, CapitalError
 from notify import send_alert
@@ -207,8 +207,30 @@ NEWS_BLACKOUT_MINUTES = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 # v3 (RSI when ranging, with-the-trend when trending) never traded either.
 # v4 = v3 + each pair enters only in its home session. Frozen here.
 STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-09-26T11:00:00")
-KILL_AFTER_TRADES = int(os.getenv("KILL_AFTER_TRADES", "60"))
+# 20, not 60. v1 reached -7.3R in 22 trades and only a human stopped it: at
+# ~6 trades a week a 60-trade gate is ten weeks of drawdown before the brake
+# is even allowed to fire, which is not a brake. 20 trades is still enough
+# that one bad run of luck cannot trip it (-5R from 20 trades at 1.5:1 is a
+# genuinely broken rule, not variance).
+KILL_AFTER_TRADES = int(os.getenv("KILL_AFTER_TRADES", "20"))
 KILL_BELOW_R = float(os.getenv("KILL_BELOW_R", "-5"))
+
+# ---- rolling stand-down
+# The kill switch measures the whole life of the strategy, so it says nothing
+# about a single bad week: 20 trades at -5R is the same verdict whether they
+# took two months or four days. This is the short-window brake. If the trades
+# closed in the last ROLLING_LOSS_DAYS total ROLLING_LOSS_R or worse, stop
+# opening positions until that window rolls past them. It expires by itself --
+# no human needed, unlike the kill switch -- because a bad week is not proof
+# of a broken rule, only a reason to stop paying to find out. 0 = off.
+ROLLING_LOSS_R = float(os.getenv("ROLLING_LOSS_R", "-4"))
+ROLLING_LOSS_DAYS = float(os.getenv("ROLLING_LOSS_DAYS", "5"))
+
+# ---- watchdog
+# Nothing here vetoes a trade; it exists to make the silent failures visible.
+# A pass every 30 minutes is normal, so anything past 40 means the external
+# pinger missed at least one and the market was unwatched for that long.
+MAX_PASS_GAP_MINUTES = float(os.getenv("MAX_PASS_GAP_MINUTES", "40"))
 
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
@@ -399,6 +421,24 @@ class RiskEngine:
         day["trades"] = day.get("trades", 0) + 1
         save_state(self.state)
 
+    def mark_pass(self, now: Optional[dt.datetime] = None) -> Optional[float]:
+        """
+        Minutes since the previous pass (None if there is no record of one), and
+        record this pass. Kept at the top level of the state, not inside the
+        day, so it survives the daily reset -- a gap that straddles midnight is
+        exactly the kind worth knowing about.
+        """
+        now = now or dt.datetime.utcnow()
+        prev = self.state.get("last_pass_utc")
+        self.state["last_pass_utc"] = now.strftime("%Y-%m-%dT%H:%M:%S")
+        save_state(self.state)
+        if not prev:
+            return None
+        try:
+            return (now - dt.datetime.strptime(prev[:19], "%Y-%m-%dT%H:%M:%S")).total_seconds() / 60.0
+        except ValueError:
+            return None
+
     def first_time_today(self, key: str) -> bool:
         """
         True only the first time `key` is seen today. Used so a condition that
@@ -481,6 +521,87 @@ def signal(closes: List[float], epic: str, cfg: Dict[str, float]) -> Optional[st
     if value >= cfg["overbought"]:
         return "SELL"
     return None
+
+
+class RegimeCall(NamedTuple):
+    """What the regime filter decided, and the sentence explaining it."""
+    side: Optional[str]      # the direction to trade, or None for no trade
+    trending: bool           # ADX said trending (the backtester prices these differently)
+    reason: str
+
+
+def regime_decision(direction: str, adx: Optional[float], pdi: Optional[float],
+                    mdi: Optional[float], adx_max: Optional[float] = None,
+                    trend_mode: Optional[str] = None) -> RegimeCall:
+    """
+    The v4 regime rule: fade the move when the market ranges, go with the trend
+    when it trends, and do nothing when RSI is stretched in the trend's own
+    direction.
+
+    THIS IS THE ONE IMPLEMENTATION. The live bot calls it to decide a real
+    order and backtest.py calls it to score history, so the two cannot drift
+    apart -- which is what happened to v2 and v3, both of which backtested and
+    then never traded. Keep it pure: no I/O, no clock, no logging.
+    """
+    adx_max = REGIME_ADX_MAX if adx_max is None else adx_max
+    trend_mode = TREND_MODE if trend_mode is None else trend_mode
+
+    if adx_max <= 0:
+        return RegimeCall(direction, False, "regime filter off")
+    if adx is None or pdi is None or mdi is None:
+        # Not enough bars for ADX. No trade: an unmeasured regime is not a
+        # ranging one, and the backtester must agree or its warm-up bars would
+        # take trades the live bot never would.
+        return RegimeCall(None, False, "not enough bars for ADX(%d)" % ADX_PERIOD)
+    if adx < adx_max:
+        return RegimeCall(direction, False,
+                          "ADX(%d) = %.1f - ranging; fading the move: %s"
+                          % (ADX_PERIOD, adx, direction))
+
+    trend = "UP" if pdi > mdi else "DOWN"
+    with_trend = "BUY" if trend == "UP" else "SELL"
+    if trend_mode != "invert":
+        return RegimeCall(None, True,
+                          "ADX(%d) = %.1f, market is trending (limit %.0f); standing aside "
+                          "(TREND_MODE=%s)" % (ADX_PERIOD, adx, adx_max, trend_mode))
+    if direction == with_trend:
+        # RSI is stretched in the trend's own direction (overbought in an
+        # uptrend). Not weakness to sell, not a pullback to buy.
+        return RegimeCall(None, True,
+                          "ADX(%d) = %.1f, trend %s (+DI %.0f / -DI %.0f); RSI is stretched "
+                          "with the trend, nothing to do" % (ADX_PERIOD, adx, trend, pdi, mdi))
+    return RegimeCall(with_trend, True,
+                      "ADX(%d) = %.1f, trend %s (+DI %.0f / -DI %.0f) - RSI says %s against it; "
+                      "trading WITH the trend instead: %s"
+                      % (ADX_PERIOD, adx, trend, pdi, mdi, direction, with_trend))
+
+
+def entry_side(closes: List[float], highs: List[float], lows: List[float], epic: str,
+               cfg: Optional[Dict[str, Any]] = None,
+               bar_hour: Optional[int] = None) -> Optional[str]:
+    """
+    The complete v4 entry rule as a pure function of candles: home session,
+    RSI on completed bars only, then the regime adjustment. The LAST element of
+    each series is the bar still forming -- the one an entry would happen on --
+    which is how the broker returns them and what the backtester calls bar i+1.
+
+    evaluate_epic() runs these same steps in this same order and then applies
+    the live-only guards (market closed, USD exposure, the flatten window, news,
+    minimum size). Every one of those can only refuse a trade this function
+    allows; none can invent one. So this is the rule, and backtest.py scores it.
+    """
+    cfg = cfg or instrument_config(epic)
+    hours = cfg.get("hours")
+    if hours and bar_hour is not None and bar_hour not in hours:
+        return None
+    completed = closes[:-1]
+    direction = signal(completed, epic, cfg)
+    if not direction:
+        return None
+    if REGIME_ADX_MAX <= 0:
+        return direction
+    adx_s, pdi_s, mdi_s = dmi_series(highs[:-1], lows[:-1], completed, ADX_PERIOD)
+    return regime_decision(direction, adx_s[-1], pdi_s[-1], mdi_s[-1]).side
 
 
 # --------------------------------------------------------------------- loop
@@ -751,30 +872,13 @@ def evaluate_epic(
 
     if REGIME_ADX_MAX > 0:
         adx_s, pdi_s, mdi_s = dmi_series(highs[:-1], lows[:-1], completed, ADX_PERIOD)
-        adx, pdi, mdi = adx_s[-1], pdi_s[-1], mdi_s[-1]
-        if adx is None or pdi is None or mdi is None:
-            log.info("%s: %s signal ignored - not enough bars for ADX(%d)", epic, direction, ADX_PERIOD)
+        # Same function the backtester scores history with. See regime_decision().
+        call = regime_decision(direction, adx_s[-1], pdi_s[-1], mdi_s[-1])
+        if call.side is None:
+            log.info("%s: %s signal ignored - %s", epic, direction, call.reason)
             return None
-        if adx < REGIME_ADX_MAX:
-            log.info("%s: ADX(%d) = %.1f - ranging; fading the move: %s", epic, ADX_PERIOD, adx, direction)
-        elif TREND_MODE == "invert":
-            trend = "UP" if pdi > mdi else "DOWN"
-            with_trend = "BUY" if trend == "UP" else "SELL"
-            if direction == with_trend:
-                # RSI is stretched in the trend's own direction (overbought in
-                # an uptrend). Not weakness to sell, not a pullback to buy.
-                log.info("%s: %s signal ignored - ADX(%d) = %.1f, trend %s (+DI %.0f / -DI %.0f); "
-                         "RSI is stretched with the trend, nothing to do",
-                         epic, direction, ADX_PERIOD, adx, trend, pdi, mdi)
-                return None
-            log.info("%s: ADX(%d) = %.1f, trend %s (+DI %.0f / -DI %.0f) - RSI says %s against it; "
-                     "trading WITH the trend instead: %s",
-                     epic, ADX_PERIOD, adx, trend, pdi, mdi, direction, with_trend)
-            direction = with_trend
-        else:
-            log.info("%s: %s signal ignored - ADX(%d) = %.1f, market is trending (limit %.0f); "
-                     "standing aside (TREND_MODE=%s)", epic, direction, ADX_PERIOD, adx, REGIME_ADX_MAX, TREND_MODE)
-            return None
+        log.info("%s: %s", epic, call.reason)
+        direction = call.side
 
     side = usd_side(epic, direction)
     if side and usd_exposure.get(side, 0) >= MAX_SAME_USD_SIDE:
@@ -958,6 +1062,110 @@ def scoreboard(closed: List[Dict[str, Any]], balance: float) -> Optional[str]:
     return None
 
 
+def rolling_veto(closed: List[Dict[str, Any]], balance: float,
+                 now: Optional[dt.datetime] = None) -> Optional[str]:
+    """
+    The short-window brake. Takes the same trade list as scoreboard() and looks
+    only at its tail: everything closed inside the last ROLLING_LOSS_DAYS. A
+    veto while that window is at or below ROLLING_LOSS_R, and nothing once the
+    losing trades age out of it, so unlike the kill switch it clears itself.
+
+    Deliberately reads the broker's own closed trades every pass rather than a
+    counter in state.json: a lost cache cannot forget a bad week.
+    """
+    if not ROLLING_LOSS_DAYS or not ROLLING_LOSS_R:
+        return None
+    risk_cash = balance * RISK_PER_TRADE_PCT / 100.0
+    if not risk_cash:
+        return None
+    now = now or dt.datetime.utcnow()
+    cutoff = now - dt.timedelta(days=ROLLING_LOSS_DAYS)
+    window = [t for t in closed if (_parse_tx_time(t) or now) >= cutoff]
+    if not window:
+        return None
+    total_r = sum(float(t.get("size") or 0) for t in window) / risk_cash
+    log.info("last %.0f days: %d trades closed, %+.1fR  (stand-down at %+.1fR)",
+             ROLLING_LOSS_DAYS, len(window), total_r, ROLLING_LOSS_R)
+    if total_r <= ROLLING_LOSS_R:
+        return ("ROLLING STAND-DOWN: %+.1fR over %d trades in the last %.0f days, at or "
+                "below %+.1fR. No new positions until those trades age out of the window. "
+                "Open positions keep their broker-side stop and target."
+                % (total_r, len(window), ROLLING_LOSS_DAYS, ROLLING_LOSS_R))
+    return None
+
+
+def watchdog(positions: List[Dict], gap_minutes: Optional[float], risk: "RiskEngine",
+             cache: Dict[str, Dict], client: CapitalClient,
+             now: Optional[dt.datetime] = None) -> List[str]:
+    """
+    Look for the failures that cost money silently, and say so in the log and
+    (once a day each) by email.
+
+    It never vetoes a trade. It can still raise -- the weekend check asks the
+    broker about a market -- so evaluate_once() wraps the call: a bug in here
+    must not be the reason the bot stops managing real positions.
+
+    Returns the problems found, worst first, for the caller to log.
+    """
+    now = now or dt.datetime.utcnow()
+    found: List[str] = []
+
+    # 1. A position with no broker-side stop. Everything about this bot's risk
+    #    model assumes the stop is attached at the broker, so that a missed run,
+    #    a dead pinger or an expired session cannot turn a 1% trade into an
+    #    open-ended one. If one is missing, nothing else here matters.
+    for raw in positions:
+        pos = raw.get("position", raw)
+        deal_id, direction, size, epic = _unpack(raw)
+        stop = pos.get("stopLevel")
+        try:
+            # None, "", 0, 0.0 and "0" all mean no stop; anything unparseable is
+            # treated as missing too, because a stop we cannot read is a stop we
+            # cannot rely on.
+            missing = stop is None or float(stop) == 0.0
+        except (TypeError, ValueError):
+            missing = True
+        if missing:
+            found.append(
+                "%s %s size %.4f (deal %s) has NO broker-side stop - the 1%% risk cap "
+                "is not enforced on it" % (epic, direction, size, deal_id or "?"))
+
+    # 2. A gap between passes. The bot is triggered by an external pinger; if
+    #    that stops, there is no error anywhere - the bot simply is not looking
+    #    at the market, and a stop-out goes unnoticed until someone checks.
+    if gap_minutes is not None and gap_minutes > MAX_PASS_GAP_MINUTES:
+        found.append("%.0f minutes since the previous pass (expected ~30) - the market "
+                     "went unwatched for that long" % gap_minutes)
+
+    # 3. A position still open on a market that shuts for the weekend. Friday's
+    #    flatten is what stops a Monday gap jumping the stop, so if one is still
+    #    here on Saturday the flatten did not happen.
+    if WEEKEND_FLATTEN and now.weekday() >= 5:
+        for raw in positions:
+            _, _, _, epic = _unpack(raw)
+            try:
+                info = cache.get(epic)
+                if info is None:
+                    info = client.market(epic)
+                    cache[epic] = info
+            except CapitalError:
+                continue
+            if closes_for_weekend(info):
+                found.append("%s is still open over the weekend - Friday's flatten did not "
+                             "close it, and Monday can gap through the stop" % epic)
+
+    for problem in found:
+        log.warning("WATCHDOG - %s", problem)
+    if found:
+        # One mail a day per distinct problem, keyed on the text, so a condition
+        # that persists for 48 passes does not send 48 emails.
+        fresh = [p for p in found if risk.first_time_today("watchdog:" + p[:40])]
+        if fresh:
+            send_alert("Trading bot: watchdog found %d problem(s)" % len(fresh),
+                       fresh + ["", "Checked at %s UTC." % now.strftime("%Y-%m-%d %H:%M")])
+    return found
+
+
 def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
     account = client.account()
     bal = account.get("balance", {}) or {}
@@ -977,6 +1185,14 @@ def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
         "  [DRY RUN]" if DRY_RUN else "",
     )
 
+    # Before any decision: the failures that cost money without raising an
+    # error. Reads the gap first, so this pass's own timestamp cannot hide it.
+    gap_minutes = risk.mark_pass(now)
+    try:
+        watchdog(open_positions, gap_minutes, risk, cache, client, now)
+    except Exception as exc:                        # never let a check stop the bot
+        log.warning("watchdog itself failed (%s) - continuing", exc)
+
     # Session housekeeping before anything else: close what should not be
     # carried overnight. If anything was closed, re-read so the cap is right.
     if manage_overnight(client, open_positions, cache):
@@ -991,23 +1207,32 @@ def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
     closed = closed_trades_since(client, min(frozen_at, now - dt.timedelta(minutes=COOLDOWN_MINUTES)))
     cooling: Set[str] = set()
     killed: Optional[str] = None
+    stood_down: Optional[str] = None
     if closed is not None:
         cutoff = now - dt.timedelta(minutes=COOLDOWN_MINUTES)
         for t in closed:
             when = _parse_tx_time(t)
             if when and when >= cutoff:
                 cooling.add((t.get("instrumentName") or "").upper())
-        killed = scoreboard([t for t in closed if (_parse_tx_time(t) or now) >= frozen_at], balance)
+        since_freeze = [t for t in closed if (_parse_tx_time(t) or now) >= frozen_at]
+        killed = scoreboard(since_freeze, balance)
+        stood_down = rolling_veto(since_freeze, balance, now)
     else:
         log.warning("trade history unreadable this pass: no cooldown, no kill check")
 
-    blocked = killed or risk.veto(equity, len(open_positions))
+    blocked = killed or stood_down or risk.veto(equity, len(open_positions))
     if blocked:
         log.error("RISK VETO - %s", blocked) if killed else log.warning("RISK VETO - %s", blocked)
         # Persistent conditions alert once a day, not every 30 minutes.
         if killed and risk.first_time_today("kill_switch"):
             send_alert("Trading bot: KILL SWITCH TRIPPED - no new trades",
                        [blocked, "", "Open positions keep their broker-side stop and target."])
+        elif stood_down and risk.first_time_today("rolling_standdown"):
+            send_alert("Trading bot: ROLLING STAND-DOWN - no new trades",
+                       [blocked, "",
+                        "This one clears itself: the window is the last %.0f days, so trading "
+                        "resumes once those losses age out of it. Nothing to reset by hand."
+                        % ROLLING_LOSS_DAYS])
         elif "daily loss limit" in blocked and risk.first_time_today("daily_loss"):
             send_alert(
                 "Trading bot: DAILY LOSS LIMIT HIT - trading halted",

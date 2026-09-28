@@ -19,6 +19,10 @@ on:
         description: "Send one test email instead of evaluating the market"
         type: boolean
         default: false
+      backtest:
+        description: "Re-score the rule on the broker's candles instead of trading"
+        type: boolean
+        default: false
 
 concurrency:
   # Never let a delayed run overlap the next one - two bots trading the same
@@ -60,8 +64,24 @@ jobs:
           ALERT_RECIPIENTS: ${{ vars.ALERT_RECIPIENTS }}
         run: python notify.py --test
 
-      - name: Evaluate
+      # A one-seconds-long proof that the live rule and the backtested rule are
+      # still the same rule, plus the brakes and the watchdog. Hermetic: no
+      # credentials, no network, no clock -- it cannot fail because the broker
+      # is down. checks.yml runs the same suite on every push, so drift is
+      # normally caught before it ever reaches this workflow.
+      #
+      # This step GATES trading, deliberately: a rule that no longer matches
+      # the one the backtest scored should not be placing live orders. The cost
+      # of that choice is that a failure here also skips the overnight and
+      # weekend flatten, so a position could sit through a weekend -- the
+      # watchdog reports exactly that on the next pass, and open positions keep
+      # their broker-side stop and target throughout.
+      - name: Rule tests
         if: ${{ !inputs.test_mail }}
+        run: python -m unittest discover -s tests
+
+      - name: Evaluate
+        if: ${{ !inputs.test_mail && !inputs.backtest }}
         env:
           CAPITAL_ENV: live
           # Arming is a secret you set yourself, exactly like uncommenting the
@@ -101,8 +121,10 @@ jobs:
           # one day". Do not loosen it to get more activity.
           RISK_PER_TRADE_PCT: "1.0"
           DAILY_LOSS_LIMIT_PCT: "3.0"
-          # One position per instrument, three across the account. Three
-          # minimum positions need ~$12 margin of the $36.67 balance.
+          # One position per instrument, three across the account. Margin per
+          # position is a few dollars; the account was $127.27 with $123.46
+          # available on 28 Sep 2026, so the cap is set by correlation risk
+          # (MAX_SAME_USD_SIDE below), not by margin.
           MAX_CONCURRENT_POSITIONS: "3"
           REWARD_TO_RISK: "1.5"
 
@@ -123,16 +145,62 @@ jobs:
           MAX_SAME_USD_SIDE: "2"
           NEWS_FILTER: "true"
           NEWS_BLACKOUT_MINUTES: "30"
-          KILL_AFTER_TRADES: "60"
+          # 20, not 60: v1 reached -7.3R in 22 trades, so a 60-trade gate is
+          # ~10 weeks at this trade rate before the brake may even fire.
+          KILL_AFTER_TRADES: "20"
           KILL_BELOW_R: "-5"
+          # Short-window brake, and the only one that clears itself: -4R inside
+          # any 5 days stops new entries until those trades age out.
+          ROLLING_LOSS_R: "-4"
+          ROLLING_LOSS_DAYS: "5"
+          # A pass every 30 min is normal; past 40 means the pinger missed one
+          # and the market went unwatched. Logged and emailed, never a veto.
+          MAX_PASS_GAP_MINUTES: "40"
         run: |
           python bot.py --once
           # The analyst writes reports/YYYY-MM-DD.md once a day after 21:00
-          # UTC. It can never fail the trading job.
+          # UTC. It can never fail the trading job. It no longer needs
+          # ANTHROPIC_API_KEY: without one it writes the day's facts from the
+          # broker's own numbers and skips only the narrative.
           python analyst.py --if-due || echo "analyst failed (non-fatal)"
 
+      # Re-score the rule on the broker's own candles. Lives here because this
+      # is where the Capital.com credentials are; it places no orders (nothing
+      # arms it) and never runs in the same pass as a trade.
+      - name: Backtest
+        if: ${{ inputs.backtest }}
+        env:
+          CAPITAL_ENV: live
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_IDENTIFIER: ${{ secrets.CAPITAL_IDENTIFIER }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+          REGIME_ADX_MAX: "25"
+          TREND_MODE: "invert"
+        run: |
+          set -o pipefail
+          # One invocation for all three pairs: --epic takes a comma-separated
+          # list and logs in once. Three separate logins drew a 429 from
+          # capital.com before (see the 3b0780d commit).
+          #
+          # No --regime / --trend / --filters: those print comparison sweeps of
+          # other parameter sets, and picking the best row out of a sweep is how
+          # a backtest gets fitted to its own history. This scores the LIVE rule
+          # as configured, which is the only number that predicts anything.
+          python backtest.py --epic EURUSD,GBPUSD,AUDUSD \
+            --resolution HOUR_4 --count 1000 --reward-to-risk 1.5 \
+            2>&1 | tee backtest-output.txt
+
+      - name: Upload the backtest
+        if: ${{ inputs.backtest }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ github.run_id }}
+          path: backtest-output.txt
+          retention-days: 30
+          if-no-files-found: warn
+
       - name: Commit the analyst's report
-        if: ${{ !inputs.test_mail }}
+        if: ${{ !inputs.test_mail && !inputs.backtest }}
         continue-on-error: true
         run: |
           if [ -n "$(git status --porcelain reports)" ]; then

@@ -87,6 +87,13 @@ def gather(client: CapitalClient, now: dt.datetime) -> Dict[str, Any]:
     risk_cash = float(bal.get("balance", 0.0)) * bot.RISK_PER_TRADE_PCT / 100.0
     realised = sum(float(t.get("size") or 0) for t in since_freeze)
 
+    # The rolling stand-down window, reported so the owner can see the short-run
+    # brake coming before it fires rather than being surprised by it.
+    roll_cutoff = now - dt.timedelta(days=bot.ROLLING_LOSS_DAYS)
+    rolling = [t for t in since_freeze if (_tx_time(t) or now) >= roll_cutoff]
+    rolling_r = (sum(float(t.get("size") or 0) for t in rolling) / risk_cash
+                 if risk_cash else None)
+
     markets = []
     for epic in bot.EPICS:
         try:
@@ -126,7 +133,11 @@ def gather(client: CapitalClient, now: dt.datetime) -> Dict[str, Any]:
                  "daily_loss_limit_pct": bot.DAILY_LOSS_LIMIT_PCT, "news_blackout_minutes": bot.NEWS_BLACKOUT_MINUTES},
         "record": {"strategy_frozen_at": bot.STRATEGY_FROZEN_AT, "trades_closed": len(since_freeze),
                    "realised_cash": round(realised, 2), "realised_R": round(realised / risk_cash, 1) if risk_cash else None,
-                   "kill_rule": "stop if <= %+.0fR after %d trades" % (bot.KILL_BELOW_R, bot.KILL_AFTER_TRADES)},
+                   "kill_rule": "stop if <= %+.0fR after %d trades" % (bot.KILL_BELOW_R, bot.KILL_AFTER_TRADES),
+                   "rolling_window_days": bot.ROLLING_LOSS_DAYS,
+                   "rolling_R": round(rolling_r, 1) if rolling_r is not None else None,
+                   "rolling_trades": len(rolling),
+                   "rolling_stand_down_at_R": bot.ROLLING_LOSS_R},
         "today": {
             "closed": [{"when_utc": (t.get("dateUtc") or "")[:16], "instrument": t.get("instrumentName"),
                         "pnl": float(t.get("size") or 0)} for t in sorted(today_closed, key=lambda t: t.get("dateUtc", ""))],
@@ -137,6 +148,112 @@ def gather(client: CapitalClient, now: dt.datetime) -> Dict[str, Any]:
         "high_impact_events_window": events,
         "note_on_closes": "A close at the stop shows as roughly -1x risk_per_trade_cash; at the target roughly +1.5x. Anything else was a flatten (Friday close, overnight cost, or a manual close).",
     }
+
+
+# ------------------------------------------------------------ render
+
+
+def _outcome(pnl: float, risk_cash: float) -> str:
+    """
+    What a close probably was, from its size in R. A heuristic, and labelled as
+    one in the report: the broker's transaction row does not say "stop" or
+    "target", it just says closed and by how much.
+    """
+    if not risk_cash:
+        return "?"
+    r = pnl / risk_cash
+    if r <= -0.8:
+        return "stop"
+    if r >= bot.REWARD_TO_RISK * 0.8:
+        return "target"
+    if abs(r) < 0.15:
+        return "flat (break-even or flatten)"
+    return "closed early (flatten, or the stop had moved)"
+
+
+def render_facts(data: Dict[str, Any]) -> str:
+    """
+    The day, straight from the broker's numbers, with no model involved.
+
+    This is the report. The narrative from write_report() is an extra on top
+    when an API key happens to be set -- it is not what makes the day legible,
+    and the record has to survive a missing key, an expired card or an API
+    outage. Five dated files by Friday is the whole point.
+    """
+    acct, rec, today = data["account"], data["record"], data["today"]
+    risk_cash = float(acct.get("risk_per_trade_cash") or 0)
+    out: List[str] = []
+
+    out.append("## What happened")
+    closed = today.get("closed") or []
+    if closed:
+        total = sum(c["pnl"] for c in closed)
+        out.append("%d position(s) closed, %+.2f in total:\n" % (len(closed), total))
+        for c in closed:
+            out.append("- `%s`  **%s**  %+.2f  (%.1fR, %s)"
+                       % (c["when_utc"][11:16], c["instrument"], c["pnl"],
+                          c["pnl"] / risk_cash if risk_cash else 0.0,
+                          _outcome(c["pnl"], risk_cash)))
+    else:
+        out.append("No positions closed today.")
+    fees = today.get("financing") or []
+    if fees:
+        out.append("\nOvernight financing: " +
+                   ", ".join("%s %+.2f" % (f["instrument"], f["amount"]) for f in fees))
+
+    out.append("\n## Open now")
+    positions = today.get("open_positions") or []
+    if positions:
+        for p in positions:
+            stop = p.get("stop")
+            out.append("- **%s %s** size %s @ %s — stop %s, target %s, open P&L %s%s (since %s)"
+                       % (p.get("instrument"), p.get("direction"), p.get("size"), p.get("entry"),
+                          stop if stop not in (None, "") else "**MISSING**",
+                          p.get("target"), p.get("open_pnl"),
+                          "" if stop not in (None, "") else "  <- no broker-side stop",
+                          p.get("opened")))
+    else:
+        out.append("Flat — no open positions.")
+
+    out.append("\n## Where the market is")
+    out.append("| pair | last | RSI(14) | ADX(14) | band | stop | 24h | 5d |")
+    out.append("|---|---|---|---|---|---|---|---|")
+    for m in data.get("markets") or []:
+        if m.get("error"):
+            out.append("| %s | — | — | — | — | — | — | *%s* |" % (m["instrument"], m["error"]))
+            continue
+        out.append("| %s | %s | %s | %s | %s | %.2f%% | %s%% | %s%% |"
+                   % (m["instrument"], m["last_close"], m["rsi14_last_completed_4h"],
+                      m["adx14_last_completed_4h"], m["band"], m["stop_pct"],
+                      m.get("change_24h_pct"), m.get("change_5d_pct")))
+    out.append("\nRSI and ADX are as of the last COMPLETED 4-hour bar — the values the "
+               "rule actually decides on. Below the band's low is a buy signal when "
+               "ranging, above its high a sell; ADX at or above %s means trending, and "
+               "the signal is taken with the trend instead."
+               % data["rule"]["adx_limit"])
+
+    out.append("\n## Record")
+    out.append("Since the rule was frozen (%s): **%d trades, %+.2f = %sR**."
+               % (rec["strategy_frozen_at"][:10], rec["trades_closed"],
+                  rec["realised_cash"], rec["realised_R"]))
+    out.append("- Kill rule: %s. *(Needs a human to clear.)*" % rec["kill_rule"])
+    if rec.get("rolling_R") is not None:
+        out.append("- Last %.0f days: %d trades, %+.1fR. Stand-down at %+.1fR. "
+                   "*(Clears itself as trades age out.)*"
+                   % (rec["rolling_window_days"], rec["rolling_trades"],
+                      rec["rolling_R"], rec["rolling_stand_down_at_R"]))
+    out.append("- 1R = $%.2f (%.1f%% of a $%s balance)."
+               % (risk_cash, bot.RISK_PER_TRADE_PCT, acct.get("balance")))
+
+    events = data.get("high_impact_events_window") or []
+    if events:
+        out.append("\n## High-impact events in the window")
+        for e in events:
+            out.append("- `%s` **%s** %s" % (e["when_utc"], e["currency"], e["event"]))
+
+    out.append("\n*Outcome labels (stop / target / flatten) are inferred from each close's "
+               "size in R; the broker's history does not state which it was.*")
+    return "\n".join(out)
 
 
 # ------------------------------------------------------------ write
@@ -191,15 +308,23 @@ def main() -> int:
             log.info("analyst: not due (before %02d:00 UTC)", RUN_AFTER_UTC_HOUR); return 0
         if state.get("analyst_last") == day:
             log.info("analyst: already written today"); return 0
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            log.info("analyst: ANTHROPIC_API_KEY not set - skipping"); return 0
 
     client = CapitalClient(); client.login()
     data = gather(client, now)
     if args.print_input:
         print(json.dumps(data, indent=1)); return 0
 
-    text = write_report(data)
+    # The facts always get written. The narrative is added on top when a key is
+    # set and the call works -- it must never be the reason a day goes unrecorded.
+    text = render_facts(data)
+    if os.getenv("ANTHROPIC_API_KEY"):
+        try:
+            text = write_report(data) + "\n\n---\n\n" + text
+        except Exception as exc:
+            log.warning("analyst: narrative failed (%s) - writing the facts alone", exc)
+    else:
+        log.info("analyst: ANTHROPIC_API_KEY not set - writing the facts without a narrative")
+
     path = save(text, data, day)
     state["analyst_last"] = day
     bot.save_state(state)

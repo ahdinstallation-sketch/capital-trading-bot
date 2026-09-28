@@ -40,7 +40,8 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from capital_client import CapitalClient, CapitalError
-from bot import INSTRUMENTS, instrument_config, OVERNIGHT_MAX_PAY_PCT, REGIME_ADX_MAX, TREND_MODE, adx_series, dmi_series
+from bot import (INSTRUMENTS, instrument_config, OVERNIGHT_MAX_PAY_PCT, REGIME_ADX_MAX,
+                 TREND_MODE, adx_series, dmi_series, regime_decision)
 
 
 # ------------------------------------------------------------------ helpers
@@ -327,38 +328,44 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
             t.opened, t.opened_idx, t.outcome, t.result_r = nxt.time, i + 1, "OPEN", 0.0
             open_trade = t
             continue
-        trending = (regime in ("adx", "both")) and (adx14[i] is None or adx14[i] >= (REGIME_ADX_MAX or 25))
-        if trending and trend_mode:
+        # "pullback" is a research-only mode: the live bot has no branch for it
+        # (bot.regime_decision stands aside on any mode that is not "invert"),
+        # so it is scored here and nowhere else. Keep it above the shared call.
+        if trend_mode == "pullback":
+            if regime not in ("adx", "both") or adx14[i] is None or adx14[i] < (REGIME_ADX_MAX or 25):
+                continue
             if pdi[i] is None or mdi[i] is None:
                 continue
             up = pdi[i] > mdi[i]
-            if trend_mode == "invert":
-                if value <= oversold and not up:
-                    side = "SELL"
-                elif value >= overbought and up:
-                    side = "BUY"
-                else:
-                    continue
-            elif trend_mode == "pullback":
-                if not up and value >= 50:
-                    side = "SELL"
-                elif up and value <= 50:
-                    side = "BUY"
-                else:
-                    continue
+            if not up and value >= 50:
+                side = "SELL"
+            elif up and value <= 50:
+                side = "BUY"
             else:
                 continue
             if trend_rr:
                 rr_here = trend_rr
         else:
+            # The live rule, from bot.py, unchanged: RSI band first, then the
+            # regime adjustment. Calling the bot's own function is the only way
+            # to be sure this backtest scores what the bot will actually do.
             if value <= oversold:
-                side = "BUY"
+                raw_side = "BUY"
             elif value >= overbought:
-                side = "SELL"
+                raw_side = "SELL"
             else:
                 continue
-            if trending:
+            adx_max = (REGIME_ADX_MAX or 25) if regime in ("adx", "both") else 0
+            # trend_mode=None here means "stand aside when trending" (v2), not
+            # "use the env default" -- pass "" so regime_decision reads it that
+            # way instead of falling back to TREND_MODE.
+            call = regime_decision(raw_side, adx14[i], pdi[i], mdi[i],
+                                   adx_max=adx_max, trend_mode=trend_mode or "")
+            if call.side is None:
                 continue
+            side = call.side
+            if call.trending and trend_rr:
+                rr_here = trend_rr
         if regime in ("sma", "both"):
             if sma50[i] is None:
                 continue
