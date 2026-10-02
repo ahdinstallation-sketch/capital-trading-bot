@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import backtest
 import bot
+import capital_client
 
 logging.disable(logging.CRITICAL)      # the rule logs on every bar; not useful here
 
@@ -924,3 +925,72 @@ class TestBacktestStillRuns(unittest.TestCase):
             self.assertLessEqual(earlier.closed, later.opened,
                                  "two trades overlapped: %s closed after %s opened"
                                  % (earlier.closed, later.opened))
+
+
+class TestAccountSelection(unittest.TestCase):
+    """
+    Which account the bot trades. On 2026-10-01 this silently changed: the
+    selection was "whatever /api/v1/accounts lists first", the order moved,
+    and the bot read a different, empty account for a day -- reporting a
+    balance of zero while the money sat untouched in the other one. It halted
+    rather than trading, which is the right failure, but nothing said why.
+    """
+
+    def _client(self, accounts):
+        client = object.__new__(capital_client.CapitalClient)
+        client._request = lambda method, path, **kw: {"accounts": accounts}
+        return client
+
+    def setUp(self):
+        self._real_env = os.environ.get("CAPITAL_ACCOUNT_ID")
+        os.environ.pop("CAPITAL_ACCOUNT_ID", None)
+        self.rich = {"accountId": "REAL", "currency": "USD",
+                     "balance": {"balance": 134.76, "available": 134.76}}
+        self.empty = {"accountId": "OTHER", "currency": "USD",
+                      "balance": {"balance": 0.0, "available": 0.0}}
+
+    def tearDown(self):
+        os.environ.pop("CAPITAL_ACCOUNT_ID", None)
+        if self._real_env is not None:
+            os.environ["CAPITAL_ACCOUNT_ID"] = self._real_env
+
+    def test_a_pinned_account_survives_a_reorder(self):
+        """The regression test for the incident: order must stop mattering."""
+        os.environ["CAPITAL_ACCOUNT_ID"] = "REAL"
+        for order in ([self.rich, self.empty], [self.empty, self.rich]):
+            chosen = self._client(order).account()
+            self.assertEqual(chosen["accountId"], "REAL")
+            self.assertEqual(chosen["balance"]["balance"], 134.76)
+
+    def test_unpinned_follows_the_api_order(self):
+        """Documents the behaviour that bit us, so a change to it is deliberate."""
+        self.assertEqual(self._client([self.empty, self.rich]).account()["accountId"], "OTHER")
+        self.assertEqual(self._client([self.rich, self.empty]).account()["accountId"], "REAL")
+
+    def test_an_unpinned_choice_between_accounts_is_logged(self):
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs(capital_client.log, level="WARNING") as caught:
+                self._client([self.empty, self.rich]).account()
+            self.assertIn("CAPITAL_ACCOUNT_ID", "\n".join(caught.output))
+        finally:
+            logging.disable(logging.CRITICAL)
+
+    def test_one_account_is_not_ambiguous(self):
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertNoLogs(capital_client.log, level="WARNING"):
+                self._client([self.rich]).account()
+        finally:
+            logging.disable(logging.CRITICAL)
+
+    def test_a_pin_that_matches_nothing_names_what_is_there(self):
+        os.environ["CAPITAL_ACCOUNT_ID"] = "TYPO"
+        with self.assertRaises(capital_client.CapitalError) as caught:
+            self._client([self.rich, self.empty]).account()
+        self.assertIn("REAL", str(caught.exception))
+        self.assertIn("OTHER", str(caught.exception))
+
+    def test_no_accounts_at_all_raises(self):
+        with self.assertRaises(capital_client.CapitalError):
+            self._client([]).account()
