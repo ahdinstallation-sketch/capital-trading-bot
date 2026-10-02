@@ -1442,6 +1442,11 @@ def main() -> int:
         help="report whether this account can trade each instrument at all, then exit",
     )
     parser.add_argument(
+        "--accounts",
+        action="store_true",
+        help="list every account on this login with its id and balance, then exit",
+    )
+    parser.add_argument(
         "--search",
         metavar="TERM",
         help="search tradeable instruments by name, print their epics, then exit",
@@ -1458,6 +1463,33 @@ def main() -> int:
         return 1
 
     risk = RiskEngine(client)
+
+    if args.accounts:
+        # Read-only. Exists because an unpinned account selection is whatever
+        # the API lists first, and that silently moved once already.
+        pinned = os.getenv("CAPITAL_ACCOUNT_ID", "").strip()
+        accounts = client.accounts()
+        print("\n  %-24s %-10s %-14s %-14s %s"
+              % ("ACCOUNT ID", "CURRENCY", "BALANCE", "AVAILABLE", ""))
+        print("  " + "-" * 78)
+        for n, acct in enumerate(accounts):
+            bal = acct.get("balance", {}) or {}
+            marks = []
+            if n == 0:
+                marks.append("<- traded when unpinned")
+            if pinned and acct.get("accountId") == pinned:
+                marks.append("<- CAPITAL_ACCOUNT_ID")
+            print("  %-24s %-10s %-14.2f %-14.2f %s"
+                  % (acct.get("accountId", "?"),
+                     acct.get("currency", "?"),
+                     float(bal.get("balance") or 0.0),
+                     float(bal.get("available") or 0.0),
+                     "  ".join(marks)))
+        if not pinned:
+            print("\n  CAPITAL_ACCOUNT_ID is not set. Set it to the id holding the money,")
+            print("  so a reorder on Capital.com's side cannot move which account trades.")
+        print("")
+        return 0
 
     if args.search:
         results = client.search_markets(args.search)

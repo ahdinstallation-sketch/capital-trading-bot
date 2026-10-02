@@ -25,11 +25,42 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import backtest
 import bot
+import capital_client
 
 logging.disable(logging.CRITICAL)      # the rule logs on every bar; not useful here
 
 
 # --------------------------------------------------------------- fixtures
+
+
+# A Wednesday, mid-afternoon UTC: a normal trading hour with nothing special
+# about it. The live pass refuses to open inside the no-new-trades window
+# (from 19:00 UTC) and refuses outright on a Friday evening, because a fresh
+# position would only be flattened again before the weekend. Both are correct
+# trading behaviour -- but a positive control that asks "did an order get
+# placed?" against the wall clock quietly becomes a calendar test, and fails
+# every Friday between 19:00 and the swap. So TestLivePass pins the clock.
+A_QUIET_WEDNESDAY = dt.datetime(2026, 9, 30, 14, 0)
+
+
+class FrozenClock:
+    """
+    Stands in for bot's `dt` module with utcnow() pinned. Everything else is
+    proxied through to the real datetime module, which is left untouched --
+    patching dt.datetime globally would reach every other import in the
+    process.
+    """
+
+    def __init__(self, frozen):
+        class _DateTime(dt.datetime):
+            @classmethod
+            def utcnow(cls):
+                return frozen
+        self.datetime = _DateTime
+
+    def __getattr__(self, name):
+        return getattr(dt, name)
+
 
 
 def candle(ts, close, high=None, low=None, open_=None, spread=0.00008):
@@ -658,12 +689,18 @@ class TestLivePass(unittest.TestCase):
         # DRY_RUN on the order path never runs -- which would make every
         # "did not open a position" assertion below pass for the wrong reason.
         bot.DRY_RUN = False
+        # A pass reads the clock to decide whether it is too late in the day,
+        # or too late in the week, to open anything. Left on the wall clock
+        # these tests pass or fail by the hour they happen to run at.
+        self._real_dt = bot.dt
+        bot.dt = FrozenClock(A_QUIET_WEDNESDAY)
 
     def tearDown(self):
         bot.STATE_PATH = self._real_state_path
         bot.send_alert = self._real_send
         bot.NEWS_FILTER = self._real_news
         bot.DRY_RUN = self._real_dry
+        bot.dt = self._real_dt
         if os.path.exists(self.tmp):
             os.remove(self.tmp)
 
@@ -691,6 +728,31 @@ class TestLivePass(unittest.TestCase):
             self.assertGreater(order["size"], 0)
             self.assertIsNotNone(order["stop"], "order placed with no stop level")
             self.assertIsNotNone(order["target"], "order placed with no target level")
+
+    def test_nothing_new_opens_late_on_a_friday(self):
+        """
+        What broke the Friday 19:07 run: inside the no-new-trades window the
+        bot still opens if it would carry the position overnight, but on a
+        Friday it would not -- the market closes for the weekend and Monday
+        can gap through the stop. So late Friday it must stand aside, and the
+        identical pass one day earlier must not.
+        """
+        friday_evening = dt.datetime(2026, 10, 2, 19, 7)
+        thursday_evening = friday_evening - dt.timedelta(days=1)
+        self.assertEqual(friday_evening.weekday(), 4)
+
+        bot.dt = FrozenClock(friday_evening)
+        friday = signalling_broker()
+        self._pass(friday)
+
+        bot.dt = FrozenClock(thursday_evening)
+        thursday = signalling_broker()
+        self._pass(thursday)
+
+        self.assertEqual(len(friday.orders), 0,
+                         "opened a position late on a Friday that the weekend flatten would close")
+        self.assertGreaterEqual(len(thursday.orders), 1,
+                                "the same hour on a Thursday must still trade")
 
     def test_the_same_usd_side_cap_holds(self):
         """
@@ -863,3 +925,72 @@ class TestBacktestStillRuns(unittest.TestCase):
             self.assertLessEqual(earlier.closed, later.opened,
                                  "two trades overlapped: %s closed after %s opened"
                                  % (earlier.closed, later.opened))
+
+
+class TestAccountSelection(unittest.TestCase):
+    """
+    Which account the bot trades. On 2026-10-01 this silently changed: the
+    selection was "whatever /api/v1/accounts lists first", the order moved,
+    and the bot read a different, empty account for a day -- reporting a
+    balance of zero while the money sat untouched in the other one. It halted
+    rather than trading, which is the right failure, but nothing said why.
+    """
+
+    def _client(self, accounts):
+        client = object.__new__(capital_client.CapitalClient)
+        client._request = lambda method, path, **kw: {"accounts": accounts}
+        return client
+
+    def setUp(self):
+        self._real_env = os.environ.get("CAPITAL_ACCOUNT_ID")
+        os.environ.pop("CAPITAL_ACCOUNT_ID", None)
+        self.rich = {"accountId": "REAL", "currency": "USD",
+                     "balance": {"balance": 134.76, "available": 134.76}}
+        self.empty = {"accountId": "OTHER", "currency": "USD",
+                      "balance": {"balance": 0.0, "available": 0.0}}
+
+    def tearDown(self):
+        os.environ.pop("CAPITAL_ACCOUNT_ID", None)
+        if self._real_env is not None:
+            os.environ["CAPITAL_ACCOUNT_ID"] = self._real_env
+
+    def test_a_pinned_account_survives_a_reorder(self):
+        """The regression test for the incident: order must stop mattering."""
+        os.environ["CAPITAL_ACCOUNT_ID"] = "REAL"
+        for order in ([self.rich, self.empty], [self.empty, self.rich]):
+            chosen = self._client(order).account()
+            self.assertEqual(chosen["accountId"], "REAL")
+            self.assertEqual(chosen["balance"]["balance"], 134.76)
+
+    def test_unpinned_follows_the_api_order(self):
+        """Documents the behaviour that bit us, so a change to it is deliberate."""
+        self.assertEqual(self._client([self.empty, self.rich]).account()["accountId"], "OTHER")
+        self.assertEqual(self._client([self.rich, self.empty]).account()["accountId"], "REAL")
+
+    def test_an_unpinned_choice_between_accounts_is_logged(self):
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs(capital_client.log, level="WARNING") as caught:
+                self._client([self.empty, self.rich]).account()
+            self.assertIn("CAPITAL_ACCOUNT_ID", "\n".join(caught.output))
+        finally:
+            logging.disable(logging.CRITICAL)
+
+    def test_one_account_is_not_ambiguous(self):
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertNoLogs(capital_client.log, level="WARNING"):
+                self._client([self.rich]).account()
+        finally:
+            logging.disable(logging.CRITICAL)
+
+    def test_a_pin_that_matches_nothing_names_what_is_there(self):
+        os.environ["CAPITAL_ACCOUNT_ID"] = "TYPO"
+        with self.assertRaises(capital_client.CapitalError) as caught:
+            self._client([self.rich, self.empty]).account()
+        self.assertIn("REAL", str(caught.exception))
+        self.assertIn("OTHER", str(caught.exception))
+
+    def test_no_accounts_at_all_raises(self):
+        with self.assertRaises(capital_client.CapitalError):
+            self._client([]).account()

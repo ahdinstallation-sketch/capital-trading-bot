@@ -172,19 +172,47 @@ class CapitalClient:
 
     # ------------------------------------------------------------- account
 
-    def account(self) -> Dict[str, Any]:
-        """Return the first (or preferred) trading account."""
+    def accounts(self) -> List[Dict[str, Any]]:
+        """Every trading account on this login, in the order the API returns."""
         data = self._request("GET", "/api/v1/accounts")
         accounts = data.get("accounts", [])
         if not accounts:
             raise CapitalError("No trading accounts returned.")
+        return accounts
+
+    def account(self) -> Dict[str, Any]:
+        """
+        The account this bot trades. Pin it with CAPITAL_ACCOUNT_ID.
+
+        Unpinned, it is whichever account the API happens to list first, and
+        that order is not ours to control: switching the active account in the
+        Capital.com app can reorder it. On 2026-10-01 it did, and the bot spent
+        a day reading a different, empty account -- reporting a balance of zero
+        while the money sat untouched in the other one. It halted instead of
+        trading, which is the right failure, but it should not have been able
+        to happen quietly. Hence the warning below.
+        """
+        accounts = self.accounts()
 
         preferred = os.getenv("CAPITAL_ACCOUNT_ID", "").strip()
         if preferred:
             for acct in accounts:
                 if acct.get("accountId") == preferred:
                     return acct
-            raise CapitalError("CAPITAL_ACCOUNT_ID %r not found." % preferred)
+            raise CapitalError(
+                "CAPITAL_ACCOUNT_ID %r not found. This login has: %s"
+                % (preferred, ", ".join(a.get("accountId", "?") for a in accounts))
+            )
+
+        if len(accounts) > 1:
+            log.warning(
+                "%d accounts on this login and CAPITAL_ACCOUNT_ID is not set - "
+                "trading %r (%s) because the API listed it first. Pin it: run "
+                "`python bot.py --accounts` and set CAPITAL_ACCOUNT_ID.",
+                len(accounts),
+                accounts[0].get("accountId", "?"),
+                (accounts[0].get("currency") or "?"),
+            )
         return accounts[0]
 
     def balance(self) -> float:

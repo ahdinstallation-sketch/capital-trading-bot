@@ -23,6 +23,10 @@ on:
         description: "Re-score the rule on the broker's candles instead of trading"
         type: boolean
         default: false
+      accounts:
+        description: "List the accounts on this login and their balances, then stop"
+        type: boolean
+        default: false
 
 concurrency:
   # Never let a delayed run overlap the next one - two bots trading the same
@@ -64,6 +68,21 @@ jobs:
           ALERT_RECIPIENTS: ${{ vars.ALERT_RECIPIENTS }}
         run: python notify.py --test
 
+      # Read-only: logs in, lists the accounts, exits. No arming secret, so
+      # the client cannot place an order even if something below changed.
+      # Deliberately ahead of the rule tests and outside their gate -- when the
+      # bot is reading the wrong account, finding out which one is the whole
+      # job, and a failing test must not stand in the way of that.
+      - name: List accounts
+        if: ${{ inputs.accounts }}
+        env:
+          CAPITAL_ENV: live
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_IDENTIFIER: ${{ secrets.CAPITAL_IDENTIFIER }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+          CAPITAL_ACCOUNT_ID: ${{ secrets.CAPITAL_ACCOUNT_ID }}
+        run: python bot.py --accounts
+
       # A one-seconds-long proof that the live rule and the backtested rule are
       # still the same rule, plus the brakes and the watchdog. Hermetic: no
       # credentials, no network, no clock -- it cannot fail because the broker
@@ -77,11 +96,11 @@ jobs:
       # watchdog reports exactly that on the next pass, and open positions keep
       # their broker-side stop and target throughout.
       - name: Rule tests
-        if: ${{ !inputs.test_mail }}
+        if: ${{ !inputs.test_mail && !inputs.accounts }}
         run: python -m unittest discover -s tests
 
       - name: Evaluate
-        if: ${{ !inputs.test_mail && !inputs.backtest }}
+        if: ${{ !inputs.test_mail && !inputs.backtest && !inputs.accounts }}
         env:
           CAPITAL_ENV: live
           # Arming is a secret you set yourself, exactly like uncommenting the
@@ -91,6 +110,12 @@ jobs:
           CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
           CAPITAL_IDENTIFIER: ${{ secrets.CAPITAL_IDENTIFIER }}
           CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+
+          # Which account to trade. Unset, the bot takes whichever one the API
+          # lists first -- and on 1 Oct 2026 that silently became a different,
+          # empty account, so it read a balance of zero for two days while the
+          # money sat in the other one. `--accounts` prints the ids.
+          CAPITAL_ACCOUNT_ID: ${{ secrets.CAPITAL_ACCOUNT_ID }}
 
           # Toggle without editing code: Settings -> Secrets and variables ->
           # Actions -> Variables. Defaults to a dry run if unset.
@@ -200,7 +225,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Commit the analyst's report
-        if: ${{ !inputs.test_mail && !inputs.backtest }}
+        if: ${{ !inputs.test_mail && !inputs.backtest && !inputs.accounts }}
         continue-on-error: true
         run: |
           if [ -n "$(git status --porcelain reports)" ]; then
