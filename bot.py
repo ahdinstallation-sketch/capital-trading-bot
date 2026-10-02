@@ -1469,6 +1469,14 @@ def main() -> int:
         # the API lists first, and that silently moved once already.
         pinned = os.getenv("CAPITAL_ACCOUNT_ID", "").strip()
         accounts = client.accounts()
+        # The whole payload, verbatim. On 1 Oct 2026 this endpoint started
+        # reporting a zero balance for an account the app showed as funded,
+        # and every explanation we reasoned toward from the parsed fields was
+        # wrong. The parsing is the thing most likely to be lying, so print
+        # what actually arrived before trusting any field in it. No
+        # credentials pass through here -- /accounts returns balances only.
+        print("\n  raw /api/v1/accounts response:")
+        print("  " + json.dumps({"accounts": accounts}, indent=2).replace("\n", "\n  "))
         print("\n  %-24s %-10s %-14s %-14s %s"
               % ("ACCOUNT ID", "CURRENCY", "BALANCE", "AVAILABLE", ""))
         print("  " + "-" * 78)
