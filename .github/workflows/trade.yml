@@ -27,6 +27,14 @@ on:
         description: "List the accounts on this login and their balances, then stop"
         type: boolean
         default: false
+      preflight:
+        description: "Ask the broker whether each instrument can actually be traded, then stop"
+        type: boolean
+        default: false
+      preflight_epics:
+        description: "Epics to preflight. Only read with `preflight`."
+        type: string
+        default: "EURUSD,GBPUSD,AUDUSD,BTCUSD"
       backtest_epics:
         description: "Epics to backtest (comma-separated). Only read with `backtest`."
         type: string
@@ -91,6 +99,23 @@ jobs:
           CAPITAL_ACCOUNT_ID: ${{ secrets.CAPITAL_ACCOUNT_ID }}
         run: python bot.py --accounts
 
+      # Read-only: logs in, reads each market's dealing rules, exits. No arming
+      # secret, so no order can be placed. Answers the one question a backtest
+      # cannot -- whether the broker's minimum deal size lets this account take
+      # the position the risk cap allows, before an epic joins the live list.
+      - name: Preflight instruments
+        if: ${{ inputs.preflight }}
+        env:
+          CAPITAL_ENV: live
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_IDENTIFIER: ${{ secrets.CAPITAL_IDENTIFIER }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+          CAPITAL_ACCOUNT_ID: ${{ secrets.CAPITAL_ACCOUNT_ID }}
+          CAPITAL_EPICS: ${{ inputs.preflight_epics || 'EURUSD,GBPUSD,AUDUSD,BTCUSD' }}
+          RISK_PER_TRADE_PCT: "1.0"
+          STOP_DISTANCE_PCT: "1.0"
+        run: python bot.py --preflight
+
       # A one-seconds-long proof that the live rule and the backtested rule are
       # still the same rule, plus the brakes and the watchdog. Hermetic: no
       # credentials, no network, no clock -- it cannot fail because the broker
@@ -104,11 +129,11 @@ jobs:
       # watchdog reports exactly that on the next pass, and open positions keep
       # their broker-side stop and target throughout.
       - name: Rule tests
-        if: ${{ !inputs.test_mail && !inputs.accounts }}
+        if: ${{ !inputs.test_mail && !inputs.accounts && !inputs.preflight }}
         run: python -m unittest discover -s tests
 
       - name: Evaluate
-        if: ${{ !inputs.test_mail && !inputs.backtest && !inputs.accounts }}
+        if: ${{ !inputs.test_mail && !inputs.backtest && !inputs.accounts && !inputs.preflight }}
         env:
           CAPITAL_ENV: live
           # Arming is a secret you set yourself, exactly like uncommenting the
@@ -238,7 +263,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Commit the analyst's report
-        if: ${{ !inputs.test_mail && !inputs.backtest && !inputs.accounts }}
+        if: ${{ !inputs.test_mail && !inputs.backtest && !inputs.accounts && !inputs.preflight }}
         continue-on-error: true
         run: |
           if [ -n "$(git status --porcelain reports)" ]; then
