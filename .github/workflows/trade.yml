@@ -169,8 +169,17 @@ jobs:
           # Financing is asymmetric too: shorts earn 0.0137%/day and are held,
           # longs pay 0.0616%/day and are flattened at the 20:00 cutoff.
           #
-          # A repository variable, if one is set, overrides this default.
-          CAPITAL_EPICS: ${{ vars.CAPITAL_EPICS || 'EURUSD,GBPUSD,AUDUSD,BTCUSD' }}
+          # Set here, not from a repository variable. This used to read
+          # `${{ vars.CAPITAL_EPICS || '...' }}`, and the variable was set to
+          # the three FX pairs -- so adding BTCUSD to the default changed
+          # nothing, twice, until a run was checked and the logged
+          # `instruments=` line still said three. The list lives in one place
+          # now, in the open, where a diff shows it changing.
+          #
+          # Changing what is traded therefore means editing this line and
+          # pushing. The `CAPITAL_EPICS` repository variable no longer does
+          # anything and should be deleted so it cannot mislead later.
+          CAPITAL_EPICS: "EURUSD,GBPUSD,AUDUSD,BTCUSD"
           # 4-hour candles: a 30-minute poll sees every candle at least eight
           # times, whereas 5-minute signals came and went between polls. It is
           # also the only resolution the broker gives 166 days of history for,
