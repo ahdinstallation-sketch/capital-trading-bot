@@ -381,7 +381,13 @@ class RiskEngine:
 
     def mark_session_start(self, balance: float) -> None:
         day = self._day()
-        if day.get("start_balance") is None:
+        start = day.get("start_balance")
+        # A non-positive baseline can only have come from a stale snapshot
+        # (1-3 Oct 2026: -134.76). Never record one, and replace one if it
+        # is already in the cached state, or today's drawdown is nonsense.
+        if balance <= 0:
+            return
+        if start is None or start <= 0:
             day["start_balance"] = balance
             save_state(self.state)
 
@@ -396,7 +402,7 @@ class RiskEngine:
         day = self._day()
         start = day.get("start_balance")
 
-        if start:
+        if start and start > 0:
             drawdown_pct = (start - equity) / start * 100.0
             if drawdown_pct >= DAILY_LOSS_LIMIT_PCT:
                 return (
@@ -1167,7 +1173,14 @@ def watchdog(positions: List[Dict], gap_minutes: Optional[float], risk: "RiskEng
 
 
 def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
-    account = client.account()
+    try:
+        account = client.account()
+    except CapitalError as exc:
+        # A pass without a trustworthy balance must not size, veto, or set
+        # today's drawdown baseline. Open positions keep their broker-side
+        # stops; the next pass is 30 minutes away. Loud on purpose.
+        log.error("ACCOUNT UNREADABLE - %s", exc)
+        return
     bal = account.get("balance", {}) or {}
     balance = float(bal.get("balance", 0.0))
     upl = float(bal.get("profitLoss") or 0.0)

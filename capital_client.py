@@ -180,19 +180,56 @@ class CapitalClient:
             raise CapitalError("No trading accounts returned.")
         return accounts
 
-    def account(self) -> Dict[str, Any]:
+    @staticmethod
+    def snapshot_is_stale(acct: Dict[str, Any]) -> bool:
         """
-        The account this bot trades. Pin it with CAPITAL_ACCOUNT_ID.
+        The broker's account summary is served from a cache that is empty for
+        the first seconds of a NEW session: balance 0, available 0, and
+        profitLoss equal to minus the deposit. Reproduced 3 Oct 2026 -- fresh
+        login, reads 1-2 returned 0.00/-134.76, read 3 returned 134.76/0.00,
+        same accountId throughout. The bot logs in fresh on every pass and read
+        it immediately, so 36 of 40 passes on 1-3 Oct saw a zero balance and
+        vetoed with "equity is zero or negative" while the money sat there.
+        A genuinely empty account (deposit 0, P&L 0) is not stale.
+        """
+        bal = acct.get("balance") or {}
+        try:
+            balance = float(bal.get("balance") or 0)
+            deposit = float(bal.get("deposit") or 0)
+            pnl = float(bal.get("profitLoss") or 0)
+        except (TypeError, ValueError):
+            return True
+        return balance == 0 and (deposit > 0 or pnl != 0)
 
-        Unpinned, it is whichever account the API happens to list first, and
-        that order is not ours to control: switching the active account in the
-        Capital.com app can reorder it. On 2026-10-01 it did, and the bot spent
-        a day reading a different, empty account -- reporting a balance of zero
-        while the money sat untouched in the other one. It halted instead of
-        trading, which is the right failure, but it should not have been able
-        to happen quietly. Hence the warning below.
+    def account(self, attempts: int = 6, pause: float = 2.0) -> Dict[str, Any]:
         """
-        accounts = self.accounts()
+        The account this bot trades, with a VALID balance snapshot -- re-read
+        up to `attempts` times, `pause` seconds apart, while the broker is
+        still serving the empty post-login cache (see snapshot_is_stale).
+        Raises CapitalError if it never settles, so callers skip the pass
+        instead of sizing, vetoing or reporting off a zero.
+
+        CAPITAL_ACCOUNT_ID pins which account when a login has several;
+        unpinned, the first listed is used (with a warning if there is more
+        than one).
+        """
+        for attempt in range(1, attempts + 1):
+            acct = self._pick_account(self.accounts())
+            if not self.snapshot_is_stale(acct):
+                if attempt > 1:
+                    log.info("account snapshot settled on read %d", attempt)
+                return acct
+            if attempt < attempts:
+                log.warning("account snapshot stale (balance 0, deposit %s, P&L %s) - re-reading in %.0fs (%d/%d)",
+                            (acct.get("balance") or {}).get("deposit"),
+                            (acct.get("balance") or {}).get("profitLoss"), pause, attempt, attempts)
+                time.sleep(pause)
+        raise CapitalError(
+            "account snapshot still stale after %d reads (%.0fs): the broker is "
+            "reporting balance 0 against a non-zero deposit. Skipping, not trading."
+            % (attempts, pause * (attempts - 1)))
+
+    def _pick_account(self, accounts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         preferred = os.getenv("CAPITAL_ACCOUNT_ID", "").strip()
         if preferred:
