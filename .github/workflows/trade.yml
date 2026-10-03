@@ -156,7 +156,21 @@ jobs:
 
           # Comma-separated. Each instrument's stop and RSI band live in
           # bot.INSTRUMENTS; anything not listed there uses the fallbacks below.
-          CAPITAL_EPICS: ${{ vars.CAPITAL_EPICS || 'EURUSD,GBPUSD,AUDUSD' }}
+          #
+          # BTCUSD added 3 Oct 2026, and it is the only one of these that trades
+          # at a weekend. Backtested on the same frozen rule over the same 166
+          # days: 50 trades, 50% win against a 42.8% breakeven, +8.57R, spread
+          # 0.07R. Preflighted the same day: minimum deal size 0.0001 BTC,
+          # margin and risk cap both fine.
+          #
+          # It is not spare capacity. Its margin factor is 50% against EURUSD's
+          # 3.3%, so one BTC position at the 1% risk size ties up about half the
+          # account's available margin and competes with the FX pairs for room.
+          # Financing is asymmetric too: shorts earn 0.0137%/day and are held,
+          # longs pay 0.0616%/day and are flattened at the 20:00 cutoff.
+          #
+          # A repository variable, if one is set, overrides this default.
+          CAPITAL_EPICS: ${{ vars.CAPITAL_EPICS || 'EURUSD,GBPUSD,AUDUSD,BTCUSD' }}
           # 4-hour candles: a 30-minute poll sees every candle at least eight
           # times, whereas 5-minute signals came and went between polls. It is
           # also the only resolution the broker gives 166 days of history for,
