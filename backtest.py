@@ -170,7 +170,9 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
         trend_rr: Optional[float] = None,
         hours: Optional[List[int]] = None,
         atr_max_pctile: Optional[float] = None,
-        strategy: str = "rsi") -> List[Trade]:
+        strategy: str = "rsi",
+        week_open_flatten: bool = False,
+        weekdays: Optional[Any] = None) -> List[Trade]:
     """
     Walk the candles once, left to right, opening and closing trades exactly
     the way bot.py would. No lookahead: the decision at bar i uses only
@@ -274,6 +276,11 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
                 r = costs.rate(t.side)
                 if r is not None:
                     t.fin_r += r / stop_pct
+            if (week_open_flatten and nxt.ts.weekday() == 6
+                    and _bar_contains(nxt, 21, costs.bar_minutes)):
+                _close(t, exit_px, "WKOP", i + 1, nxt.time)
+                open_trade = None
+                continue
             if before_gap:
                 _close(t, exit_px, "WKND", i + 1, nxt.time)
                 open_trade = None
@@ -304,6 +311,8 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
             continue
         if hours is not None and bars[i + 1].ts.hour not in hours:
             continue   # the ENTRY bar's open hour must be in the allowed set
+        if weekdays is not None and bars[i + 1].ts.weekday() not in weekdays:
+            continue   # measurement only: confine entries to given weekdays
         if atr_max_pctile is not None and atr[i] is not None and i >= 200:
             window = [x for x in atr[i - 200:i] if x is not None]
             if window and sum(1 for x in window if x <= atr[i]) / len(window) * 100 > atr_max_pctile:
@@ -639,6 +648,36 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
             print("%-44s %6d %5.0f %+7.2f %+8.2f %+9.2f" % (label, s["n"], s["win_pct"], s["avg_r"], s["total_r"], s["total_r"] * risk_cash))
         return
 
+    if args.weekend_split:
+        oversold, overbought = live_band
+        print("Does confining this instrument around the FX week cost anything?%s"
+              % (" (entries since %s)" % args.since if args.since else ""))
+        print("")
+        print("  WKOP = closed at Sunday 21:00 UTC, just before FX reopens, so nothing")
+        print("  it holds is still tying up margin when the three pairs want to trade.")
+        print("  The 21:00 financing charge is still paid before the close.")
+        print("")
+        print("%-42s %6s %5s %7s %8s %9s" % ("rule", "trades", "win%", "avg R", "total R", "P&L $"))
+        print("-" * 84)
+        for label, wkop, wdays in (
+                ("as it trades now (24/7, nothing confined)", False, None),
+                ("flattened at Sunday 21:00 UTC", True, None),
+                ("weekend entries only (Sat/Sun)", False, {5, 6}),
+                ("weekend entries + Sunday 21:00 flatten", True, {5, 6}),
+        ):
+            trades = run(bars, args.period, float(oversold), float(overbought), stop_pct, rr,
+                         args.breakeven_at, args.trail, costs, live_regime, since, live_trend,
+                         None, live_hours, None, "rsi", wkop, wdays)
+            st = summarise(trades, days)
+            print("%-42s %6d %5.0f %+7.2f %+8.2f %+9.2f"
+                  % (label, st["n"], st["win_pct"], st["avg_r"], st["total_r"],
+                     st["total_r"] * risk_cash))
+        print("")
+        print("  A rule that costs little and removes the Monday-morning margin")
+        print("  squeeze is worth having; one that removes most of the trades is")
+        print("  just a slower way of not trading the instrument at all.")
+        return
+
     if args.filters:
         oversold, overbought = live_band
         print("Live strategy (v3) with extra entry filters%s:" % (" (entries since %s)" % args.since if args.since else ""))
@@ -762,6 +801,8 @@ def main() -> int:
                     help="compare what to do in a TRENDING market: stand aside / invert / pullback, at 1.5 and 2.0 RR")
     ap.add_argument("--plugins", action="store_true",
                     help="score the trading-plugin rules (VCP, momentum burst, Donchian, cycle) against the live rule")
+    ap.add_argument("--weekend-split", action="store_true",
+                    help="cost of confining the instrument around the FX week")
     ap.add_argument("--filters", action="store_true",
                     help="on the live strategy, compare entry-hour and volatility filters")
     ap.add_argument("--no-regime", action="store_true",

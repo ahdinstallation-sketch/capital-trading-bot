@@ -39,6 +39,10 @@ on:
         description: "Epics to backtest (comma-separated). Only read with `backtest`."
         type: string
         default: "EURUSD,GBPUSD,AUDUSD"
+      backtest_weekend_split:
+        description: "Backtest: cost of confining the instrument around the FX week"
+        type: boolean
+        default: false
       backtest_balance:
         description: "Account size the backtest sizes trades from. Only read with `backtest`."
         type: string
@@ -273,6 +277,7 @@ jobs:
           # dollar column would come out zero. R-multiples do not depend on it.
           python backtest.py --epic "${{ inputs.backtest_epics || 'EURUSD,GBPUSD,AUDUSD' }}" \
             --balance "${{ inputs.backtest_balance || '134.76' }}" \
+            ${{ inputs.backtest_weekend_split && '--weekend-split' || '' }} \
             --resolution HOUR_4 --count 1000 --reward-to-risk 1.5 \
             2>&1 | tee backtest-output.txt
 
