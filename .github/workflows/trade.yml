@@ -27,6 +27,14 @@ on:
         description: "List the accounts on this login and their balances, then stop"
         type: boolean
         default: false
+      backtest_epics:
+        description: "Epics to backtest (comma-separated). Only read with `backtest`."
+        type: string
+        default: "EURUSD,GBPUSD,AUDUSD"
+      backtest_balance:
+        description: "Account size the backtest sizes trades from. Only read with `backtest`."
+        type: string
+        default: "134.76"
 
 concurrency:
   # Never let a delayed run overlap the next one - two bots trading the same
@@ -211,7 +219,12 @@ jobs:
           # other parameter sets, and picking the best row out of a sweep is how
           # a backtest gets fitted to its own history. This scores the LIVE rule
           # as configured, which is the only number that predicts anything.
-          python backtest.py --epic EURUSD,GBPUSD,AUDUSD \
+          #
+          # --balance is passed explicitly: it otherwise defaults to the live
+          # account balance, which the API currently reports as 0.00, and every
+          # dollar column would come out zero. R-multiples do not depend on it.
+          python backtest.py --epic "${{ inputs.backtest_epics || 'EURUSD,GBPUSD,AUDUSD' }}" \
+            --balance "${{ inputs.backtest_balance || '134.76' }}" \
             --resolution HOUR_4 --count 1000 --reward-to-risk 1.5 \
             2>&1 | tee backtest-output.txt
 
