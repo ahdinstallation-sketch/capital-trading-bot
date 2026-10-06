@@ -63,6 +63,16 @@ REGIME_ADX_MAX = float(os.getenv("REGIME_ADX_MAX", "25"))   # 0 disables the fil
 #           target as ranging trades -- one fewer parameter to have fitted.
 TREND_MODE = os.getenv("TREND_MODE", "invert").strip().lower()
 
+# v5 (6 Oct 2026): do not go with the trend when the RSI reading that
+# triggered it is already past this level (<= it, or >= 100 - it). A dip to
+# RSI 21 in a downtrend is not weakness to sell, it is a move that has
+# already run; three such sells were stopped by the bounce on 5-6 Oct, the
+# first at RSI 21.3. Measured on the same 166 days before deploying: lifts
+# EVERY pair (EUR +$8 -> +$15, GBP +$15 -> +$17, AUD +$17 -> +$25) on fewer
+# trades with a higher win rate, and holds at 25, 30 and 35 -- a plateau,
+# not a fitted spike. 30 is the textbook oversold line. 0 disables.
+TREND_EXHAUST_RSI = float(os.getenv("TREND_EXHAUST_RSI", "30"))
+
 # Fallbacks for any epic not in INSTRUMENTS below.
 RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30"))
 RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "70"))
@@ -205,8 +215,10 @@ NEWS_BLACKOUT_MINUTES = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 # v1 (RSI only, frozen 9 Sep): 24 trades, -$9.23 = -6.9R by 26 Sep. Stopped.
 # v2 (RSI + ADX<25 stand-aside) never traded -- superseded the same morning.
 # v3 (RSI when ranging, with-the-trend when trending) never traded either.
-# v4 = v3 + each pair enters only in its home session. Frozen here.
-STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-09-26T11:00:00")
+# v4 = v3 + each pair enters only in its home session: 26 Sep - 6 Oct,
+#      11 trades, +2.9R.
+# v5 = v4 + no with-the-trend entry when RSI is already exhausted. Frozen here.
+STRATEGY_FROZEN_AT = os.getenv("STRATEGY_FROZEN_AT", "2026-10-06T13:30:00")
 # 20, not 60. v1 reached -7.3R in 22 trades and only a human stopped it: at
 # ~6 trades a week a 60-trade gate is ten weeks of drawdown before the brake
 # is even allowed to fire, which is not a brake. 20 trades is still enough
@@ -538,7 +550,9 @@ class RegimeCall(NamedTuple):
 
 def regime_decision(direction: str, adx: Optional[float], pdi: Optional[float],
                     mdi: Optional[float], adx_max: Optional[float] = None,
-                    trend_mode: Optional[str] = None) -> RegimeCall:
+                    trend_mode: Optional[str] = None,
+                    rsi_value: Optional[float] = None,
+                    exhaust: Optional[float] = None) -> RegimeCall:
     """
     The v4 regime rule: fade the move when the market ranges, go with the trend
     when it trends, and do nothing when RSI is stretched in the trend's own
@@ -576,6 +590,13 @@ def regime_decision(direction: str, adx: Optional[float], pdi: Optional[float],
         return RegimeCall(None, True,
                           "ADX(%d) = %.1f, trend %s (+DI %.0f / -DI %.0f); RSI is stretched "
                           "with the trend, nothing to do" % (ADX_PERIOD, adx, trend, pdi, mdi))
+    exhaust = TREND_EXHAUST_RSI if exhaust is None else exhaust
+    if rsi_value is not None and exhaust > 0 and (rsi_value <= exhaust or rsi_value >= 100 - exhaust):
+        # v5: the counter-trend move has already run too far to chase. A
+        # dip to RSI 21 in a downtrend bounces more often than it continues.
+        return RegimeCall(None, True,
+                          "ADX(%d) = %.1f, trend %s, but RSI %.1f is past %.0f - the move is "
+                          "exhausted; not chasing it" % (ADX_PERIOD, adx, trend, rsi_value, exhaust))
     return RegimeCall(with_trend, True,
                       "ADX(%d) = %.1f, trend %s (+DI %.0f / -DI %.0f) - RSI says %s against it; "
                       "trading WITH the trend instead: %s"
@@ -607,7 +628,8 @@ def entry_side(closes: List[float], highs: List[float], lows: List[float], epic:
     if REGIME_ADX_MAX <= 0:
         return direction
     adx_s, pdi_s, mdi_s = dmi_series(highs[:-1], lows[:-1], completed, ADX_PERIOD)
-    return regime_decision(direction, adx_s[-1], pdi_s[-1], mdi_s[-1]).side
+    return regime_decision(direction, adx_s[-1], pdi_s[-1], mdi_s[-1],
+                           rsi_value=rsi(completed, RSI_PERIOD)).side
 
 
 # --------------------------------------------------------------------- loop
@@ -879,7 +901,8 @@ def evaluate_epic(
     if REGIME_ADX_MAX > 0:
         adx_s, pdi_s, mdi_s = dmi_series(highs[:-1], lows[:-1], completed, ADX_PERIOD)
         # Same function the backtester scores history with. See regime_decision().
-        call = regime_decision(direction, adx_s[-1], pdi_s[-1], mdi_s[-1])
+        call = regime_decision(direction, adx_s[-1], pdi_s[-1], mdi_s[-1],
+                               rsi_value=rsi(completed, RSI_PERIOD))
         if call.side is None:
             log.info("%s: %s signal ignored - %s", epic, direction, call.reason)
             return None
@@ -1217,6 +1240,9 @@ def evaluate_once(client: CapitalClient, risk: RiskEngine) -> None:
         frozen_at = dt.datetime.strptime(STRATEGY_FROZEN_AT[:19], "%Y-%m-%dT%H:%M:%S")
     except ValueError:
         frozen_at = now
+    # A freeze stamped in the future would shrink the history window to the
+    # cooldown and blind the kill switch and the stand-down. Clamp it.
+    frozen_at = min(frozen_at, now)
     closed = closed_trades_since(client, min(frozen_at, now - dt.timedelta(minutes=COOLDOWN_MINUTES)))
     cooling: Set[str] = set()
     killed: Optional[str] = None

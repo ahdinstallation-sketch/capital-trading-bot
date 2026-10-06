@@ -199,7 +199,12 @@ class TestLiveMatchesBacktest(unittest.TestCase):
         self._assert_parity(wave(), "EURUSD")
 
     def test_parity_trending_eurusd(self):
-        self._assert_parity(trending(), "EURUSD")
+        from unittest import mock
+        # The straight-line fixture pins RSI under 30, where v5 refuses every
+        # with-trend entry (correctly). Parity of the v4 mechanics is tested
+        # with exhaustion off; the exhaustion branch has its own tests.
+        with mock.patch.object(bot, "TREND_EXHAUST_RSI", 0):
+            self._assert_parity(trending(), "EURUSD")
 
     def test_parity_ranging_audusd(self):
         # Different home session (Asia-night bars) and a different stop.
@@ -893,6 +898,11 @@ class TestBacktestStillRuns(unittest.TestCase):
         self.assertTrue(trades, "the live configuration scored no trades at all")
 
     def test_standing_aside_trades_less_than_inverting(self):
+        from unittest import mock
+        with mock.patch.object(bot, "TREND_EXHAUST_RSI", 0):   # v4 mechanics; v5's exhaustion has its own tests
+            self._standing_aside_trades_less_than_inverting()
+
+    def _standing_aside_trades_less_than_inverting(self):
         """
         v2 (stand aside when trending) must take fewer trades than v4 (trade
         with the trend). Run on a TRENDING series on purpose: on a ranging one
@@ -994,3 +1004,42 @@ class TestAccountSelection(unittest.TestCase):
     def test_no_accounts_at_all_raises(self):
         with self.assertRaises(capital_client.CapitalError):
             self._client([]).account()
+
+
+class TestExhaustion(unittest.TestCase):
+    """v5: no with-the-trend entry when the RSI reading is already exhausted."""
+
+    def test_exhausted_dip_in_a_downtrend_is_not_sold(self):
+        call = bot.regime_decision("BUY", 44.0, 9.0, 40.0, adx_max=25, trend_mode="invert",
+                                   rsi_value=21.3, exhaust=30)
+        self.assertIsNone(call.side)
+        self.assertIn("exhausted", call.reason)
+
+    def test_moderate_dip_in_a_downtrend_is_still_sold(self):
+        call = bot.regime_decision("BUY", 44.0, 9.0, 40.0, adx_max=25, trend_mode="invert",
+                                   rsi_value=33.7, exhaust=30)
+        self.assertEqual(call.side, "SELL")
+
+    def test_exhausted_rally_in_an_uptrend_is_not_bought(self):
+        call = bot.regime_decision("SELL", 40.0, 35.0, 10.0, adx_max=25, trend_mode="invert",
+                                   rsi_value=74.0, exhaust=30)
+        self.assertIsNone(call.side)
+
+    def test_zero_disables_the_rule(self):
+        call = bot.regime_decision("BUY", 44.0, 9.0, 40.0, adx_max=25, trend_mode="invert",
+                                   rsi_value=21.3, exhaust=0)
+        self.assertEqual(call.side, "SELL")
+
+    def test_ranging_is_unaffected(self):
+        call = bot.regime_decision("BUY", 18.0, 20.0, 22.0, adx_max=25, trend_mode="invert",
+                                   rsi_value=21.3, exhaust=30)
+        self.assertEqual(call.side, "BUY")
+
+    def test_live_and_backtest_agree_on_an_exhausted_bar(self):
+        """The one shared function, called the way each side calls it."""
+        rsis = [21.3, 33.7, 74.0, 50.0]
+        for r in rsis:
+            live = bot.regime_decision("BUY", 44.0, 9.0, 40.0, rsi_value=r).side
+            scored = bot.regime_decision("BUY", 44.0, 9.0, 40.0, adx_max=25,
+                                         trend_mode="invert", rsi_value=r).side
+            self.assertEqual(live, scored, "RSI %.1f: live %s vs scored %s" % (r, live, scored))

@@ -170,7 +170,8 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
         trend_rr: Optional[float] = None,
         hours: Optional[List[int]] = None,
         atr_max_pctile: Optional[float] = None,
-        strategy: str = "rsi") -> List[Trade]:
+        strategy: str = "rsi",
+        trend_filter: Optional[str] = None) -> List[Trade]:
     """
     Walk the candles once, left to right, opening and closing trades exactly
     the way bot.py would. No lookahead: the decision at bar i uses only
@@ -360,12 +361,35 @@ def run(bars: List[Bar], period: int, oversold: float, overbought: float,
             # "use the env default" -- pass "" so regime_decision reads it that
             # way instead of falling back to TREND_MODE.
             call = regime_decision(raw_side, adx14[i], pdi[i], mdi[i],
-                                   adx_max=adx_max, trend_mode=trend_mode or "")
+                                   adx_max=adx_max, trend_mode=trend_mode or "",
+                                   rsi_value=rsis[i])
             if call.side is None:
                 continue
             side = call.side
             if call.trending and trend_rr:
                 rr_here = trend_rr
+            # Research-only refinements of the with-the-trend entry (6 Oct 2026),
+            # asked after three with-trend sells were stopped by a reversal:
+            #   adx_rising   only go with the trend while ADX is still rising
+            #                (trend strengthening, not fading)
+            #   no_exhaust   skip when RSI is already past 30/70 -- too stretched
+            #   confirm      the signal bar must close in the trend's direction
+            #   rising+conf  both of the first and third
+            if call.trending and trend_filter:
+                rising = adx14[i - 1] is not None and adx14[i] > adx14[i - 1]
+                ex = 30.0
+                if trend_filter.startswith("no_exhaust:"):
+                    ex = float(trend_filter.split(":")[1])
+                exhausted = rsis[i] is not None and (rsis[i] <= ex or rsis[i] >= 100 - ex)
+                confirmed = (closes[i] < closes[i - 1]) if side == "SELL" else (closes[i] > closes[i - 1])
+                if trend_filter == "adx_rising" and not rising:
+                    continue
+                if trend_filter.startswith("no_exhaust") and exhausted:
+                    continue
+                if trend_filter == "confirm" and not confirmed:
+                    continue
+                if trend_filter == "rising+conf" and not (rising and confirmed):
+                    continue
         if regime in ("sma", "both"):
             if sma50[i] is None:
                 continue
@@ -621,6 +645,22 @@ def test_epic(client: CapitalClient, epic: str, args, balance: float) -> None:
               % (REGIME_ADX_MAX, REGIME_ADX_MAX, "trade WITH the trend" if live_trend else "stand aside"))
     else:
         print("regime     none")
+    if args.trendfix:
+        oversold, overbought = live_band
+        print("With-the-trend entry refinements vs v4%s:" % (" (entries since %s)" % args.since if args.since else ""))
+        print("")
+        print("%-38s %6s %5s %7s %8s %9s" % ("rule", "trades", "win%", "avg R", "total R", "P&L $"))
+        print("-" * 80)
+        for label, tf in (("live rule", None), ("trend only while ADX rising", "adx_rising"),
+                          # (exhaustion is now part of the live rule -- v5 -- so the
+                          #  rows below are historical; set TREND_EXHAUST_RSI=0 to see v4)
+                          ("confirmation bar", "confirm"), ("ADX rising + confirmation", "rising+conf")):
+            trades = run(bars, args.period, float(oversold), float(overbought), stop_pct, rr, None, None,
+                         costs, live_regime, since, live_trend, None, live_hours, None, "rsi", tf)
+            s = summarise(trades, days)
+            print("%-38s %6d %5.0f %+7.2f %+8.2f %+9.2f" % (label, s["n"], s["win_pct"], s["avg_r"], s["total_r"], s["total_r"] * risk_cash))
+        return
+
     if args.plugins:
         oversold, overbought = live_band
         print("Plugin rules vs the live rule, same stop (%.2f%%), same costs%s:" % (stop_pct, " (entries since %s)" % args.since if args.since else ""))
@@ -760,6 +800,8 @@ def main() -> int:
                     help="compare regime filters (none / adx / sma50 side / both) on the live band")
     ap.add_argument("--trend", action="store_true",
                     help="compare what to do in a TRENDING market: stand aside / invert / pullback, at 1.5 and 2.0 RR")
+    ap.add_argument("--trendfix", action="store_true",
+                    help="score refinements of the with-the-trend entry against v4")
     ap.add_argument("--plugins", action="store_true",
                     help="score the trading-plugin rules (VCP, momentum burst, Donchian, cycle) against the live rule")
     ap.add_argument("--filters", action="store_true",
