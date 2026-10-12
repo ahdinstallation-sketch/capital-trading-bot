@@ -66,9 +66,13 @@ def fetch(client, epic, res, start, end):
     raw, cur = [], start
     while cur < end:
         nxt = min(cur + chunk, end)
-        raw += client._request("GET", "/api/v1/prices/%s" % epic, params={
-            "resolution": res, "max": 1000,
-            "from": cur.strftime("%Y-%m-%dT%H:%M:%S"), "to": nxt.strftime("%Y-%m-%dT%H:%M:%S")}).get("prices", [])
+        try:
+            raw += client._request("GET", "/api/v1/prices/%s" % epic, params={
+                "resolution": res, "max": 1000,
+                "from": cur.strftime("%Y-%m-%dT%H:%M:%S"), "to": nxt.strftime("%Y-%m-%dT%H:%M:%S")}).get("prices", [])
+        except CapitalError as exc:
+            if "not-found" not in str(exc):     # a period before the market existed is empty, not an error
+                raise
         cur = nxt
     return load(raw)
 
